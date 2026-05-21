@@ -18,7 +18,7 @@ import torch
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import logging
 
 @dataclass
 class GameState:
@@ -45,6 +45,7 @@ class MCTSNode:
         parent: Parent node (None for root)
         action_taken: Action index that led to this node from parent
         num_actions: Number of possible actions
+        model_priors: Optional array of action probabilities from model (for selection)
     """
 
     def __init__(
@@ -54,12 +55,14 @@ class MCTSNode:
         parent: Optional['MCTSNode'] = None,
         action_taken: Optional[int] = None,
         num_actions: int = 4,
+        model_priors: Optional[np.ndarray] = None,
     ):
         self.state = state
         self.save_path = save_path
         self.parent = parent
         self.action_taken = action_taken
         self.num_actions = num_actions
+        self.model_priors = model_priors
 
         # Tree structure
         self.children: Dict[int, 'MCTSNode'] = {}
@@ -77,16 +80,19 @@ class MCTSNode:
         """Check if all actions have been tried."""
         return len(self.untried_actions) == 0
 
-    def best_child(self, c: float = 1.414) -> 'MCTSNode':
-        """Select best child using UCB1 formula.
+    def best_child(self, c: float = 1.414, use_puct: bool = True) -> 'MCTSNode':
+        """Select best child using UCB1 or PUCT formula.
 
-        UCB = Q/N + c * sqrt(log(parent_visits) / N)
+        UCB1 = Q/N + c * sqrt(log(N) / n)
+        PUCT = Q/N + c * P * sqrt(N) / (1 + n)
+        where P is prior probability, N is parent visits, n is child visits
 
         Args:
             c: Exploration constant (sqrt(2) is standard for [0,1] rewards)
+            use_puct: If True, use PUCT with priors; if False, use standard UCB1
 
         Returns:
-            Best child node according to UCB1
+            Best child node according to selected formula
         """
         if not self.children:
             raise ValueError("Cannot select best child from leaf node")
@@ -100,7 +106,13 @@ class MCTSNode:
                 score = float('inf')
             else:
                 exploitation = child.total_value / child.visits
-                exploration = c * math.sqrt(math.log(self.visits) / child.visits)
+                if use_puct:
+                    # PUCT formula with model priors
+                    prior = self.model_priors[action] if self.model_priors is not None else 1.0 / self.num_actions
+                    exploration = c * prior * math.sqrt(self.visits) / (1.0 + child.visits)
+                else:
+                    # Standard UCB1 formula
+                    exploration = c * math.sqrt(math.log(self.visits) / child.visits)
                 score = exploitation + exploration
 
             if score > best_score:
@@ -109,12 +121,13 @@ class MCTSNode:
 
         return best_child
 
-    def best_child_parallel(self, c: float = 1.414, exclude_pending: bool = True) -> Optional['MCTSNode']:
-        """Select best child, optionally excluding nodes being expanded in parallel.
+    def best_child_parallel(self, c: float = 1.414, exclude_pending: bool = True, use_puct: bool = True) -> Optional['MCTSNode']:
+        """Select best child using UCB1 or PUCT, optionally excluding nodes being expanded in parallel.
 
         Args:
             c: Exploration constant
             exclude_pending: If True, skip children that are currently being expanded
+            use_puct: If True, use PUCT with priors; if False, use standard UCB1
 
         Returns:
             Best child node or None if all children are pending
@@ -132,7 +145,11 @@ class MCTSNode:
                 score = float('inf')
             else:
                 exploitation = child.total_value / child.visits
-                exploration = c * math.sqrt(math.log(self.visits) / child.visits)
+                if use_puct:
+                    prior = self.model_priors[action] if self.model_priors is not None else 1.0 / self.num_actions
+                    exploration = c * prior * math.sqrt(self.visits) / (1.0 + child.visits)
+                else:
+                    exploration = c * math.sqrt(math.log(self.visits) / child.visits)
                 score = exploitation + exploration
 
             if score > best_score:
@@ -141,15 +158,19 @@ class MCTSNode:
 
         return best_child
 
-    def select_leaf_for_expansion(self, c: float = 1.414) -> Optional['MCTSNode']:
+    def select_leaf_for_expansion(self, c: float = 1.414, use_puct: bool = True) -> Optional['MCTSNode']:
         """Traverse tree to find a leaf node for expansion (for parallel).
+
+        Args:
+            c: Exploration constant
+            use_puct: If True, use PUCT; if False, use UCB1
 
         Returns:
             A leaf node ready for expansion, or None if tree is locked
         """
         node = self
         while node.is_fully_expanded() and node.children:
-            node = node.best_child_parallel(c, exclude_pending=True)
+            node = node.best_child_parallel(c, exclude_pending=True, use_puct=use_puct)
             if node is None:
                 return None  # All children expanding
         return node
@@ -220,6 +241,8 @@ class MCTSAgent:
         device: Torch device for model inference
         temp_dir: Directory for temporary save files (default: system temp)
         batch_size: Number of parallel simulations to run (default: 1, sequential)
+        use_puct: If True, use PUCT formula with model priors; if False, use standard UCB1 (default: True)
+        rollout_temperature: Temperature for action sampling during rollouts. Lower=more greedy, Higher=more random (default: 1.0)
     """
 
     ACTION_NAMES = ['shoot', 'move_forward', 'turn_left', 'turn_right']
@@ -242,6 +265,8 @@ class MCTSAgent:
         device: str = 'cpu',
         temp_dir: Optional[str] = None,
         batch_size: int = 1,
+        use_puct: bool = True,
+        rollout_temperature: float = 0.1,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -252,6 +277,8 @@ class MCTSAgent:
         self.num_actions = num_actions
         self.device = device
         self.batch_size = batch_size
+        self.use_puct = use_puct
+        self.rollout_temperature = rollout_temperature
         self.temp_dir = temp_dir or tempfile.gettempdir()
         self._save_counter = 0
 
@@ -367,19 +394,76 @@ class MCTSAgent:
 
         return input_ids, attention_mask, depth_ids
 
+    def _sample_action_from_current_state(self) -> int:
+        """Get current game state, evaluate model, and sample an action.
+
+        Returns:
+            Action index sampled from model's probability distribution
+        """
+        state_obj = self.current_game.get_state()
+        if state_obj is None:
+            return np.random.randint(self.num_actions)
+
+        screen = state_obj.screen_buffer
+        depth = state_obj.depth_buffer if hasattr(state_obj, 'depth_buffer') else None
+
+        # Convert to ASCII
+        if screen.ndim == 3:
+            gray = np.mean(screen, axis=2).astype(np.uint8)
+        else:
+            gray = screen
+
+        if depth is not None:
+            ascii_frame, depth_bins = self.converter.convert_with_depth(
+                gray, depth.astype(np.float32), num_bins=16
+            )
+        else:
+            ascii_frame = self.converter.convert_simple(gray)
+            depth_bins = None
+
+        # Create temporary state for model evaluation
+        rollout_state = GameState(
+            ascii_frame=ascii_frame,
+            depth_bins=depth_bins,
+            health=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.HEALTH),
+            armor=self.current_game.get_game_variable(__import__('vizdoom').GameVariable.ARMOR),
+            game_reward=float(self.current_game.get_game_variable(__import__('vizdoom').GameVariable.KILLCOUNT)),
+        )
+
+        # Get model priors for action selection
+        input_ids, attention_mask, depth_ids = self._prepare_model_input(rollout_state)
+        action_probs = self._evaluate_state(input_ids, attention_mask, depth_ids)
+
+        # Apply temperature scaling to control exploration during rollout
+        if self.rollout_temperature != 1.0:
+            action_probs = np.power(action_probs, 1.0 / self.rollout_temperature)
+            action_probs = action_probs / action_probs.sum()
+
+        # Sample action from model distribution
+        return np.random.choice(self.num_actions, p=action_probs)
+
     def _select(self, node: MCTSNode) -> MCTSNode:
-        """Selection: traverse tree using UCB1 until reaching unexpanded node."""
+        """Selection: traverse tree using UCB1 or PUCT until reaching unexpanded node."""
         while node.is_fully_expanded() and node.children:
-            node = node.best_child(self.c)
+            node = node.best_child(self.c, use_puct=self.use_puct)
         return node
 
     def _expand(self, node: MCTSNode) -> MCTSNode:
-        """Expansion: create child node for an untried action."""
+        """Expansion: create child node for an untried action.
+        Uses model priors from parent node to bias action selection.
+        """
         if not node.untried_actions:
             return node
 
-        # Select random untried action (can use policy prior here)
-        action = node.untried_actions.pop(0)
+        # Select untried action, preferring high-prior actions
+        if node.model_priors is not None:
+            # Choose action with highest prior among untried actions
+            best_action = max(node.untried_actions, key=lambda a: node.model_priors[a])
+            node.untried_actions.remove(best_action)
+            action = best_action
+        else:
+            # Fallback to sequential selection
+            action = node.untried_actions.pop(0)
 
         # Load parent state and take action
         self._copy_state_for_expansion(node)
@@ -390,20 +474,26 @@ class MCTSAgent:
         # Capture new state
         child_state, save_path = self._create_state_from_game()
 
-        # Create child node
+        # Evaluate model priors for child state (will be used when selecting its children)
+        input_ids, attention_mask, depth_ids = self._prepare_model_input(child_state)
+        child_priors = self._evaluate_state(input_ids, attention_mask, depth_ids)
+
+        logging.debug(f"Expanding node with action '{action_name}' (index {action}) - model priors: {child_priors}")
+        # Create child node with its own priors
         child = MCTSNode(
             state=child_state,
             save_path=save_path,
             parent=node,
             action_taken=action,
             num_actions=self.num_actions,
+            model_priors=child_priors,
         )
 
         node.children[action] = child
         return child
 
     def _rollout(self, node: MCTSNode) -> float:
-        """Rollout: simulate random actions and return binary win/lose.
+        """Rollout: simulate actions using model priors and return binary win/lose.
 
         Win: Game reward increased during rollout
         Lose: Health OR armor decreased with no game reward increase
@@ -426,13 +516,14 @@ class MCTSAgent:
             vizdoom.GameVariable.KILLCOUNT
         )
 
-        # Simulate random actions
+        # Simulate actions guided by model
         for _ in range(self.rollout_depth):
             if self.current_game.is_episode_finished():
                 break
 
-            # Random action
-            action = np.random.randint(self.num_actions)
+            # Get action from model and execute it
+            action = self._sample_action_from_current_state()
+            logging.debug(f"Rollout action: {self.ACTION_NAMES[action]} (index {action})")
             action_name = self.ACTION_NAMES[action]
             buttons = self.ACTION_TO_BUTTONS[action_name]
             self.current_game.make_action(buttons, 4)
@@ -448,17 +539,11 @@ class MCTSAgent:
             vizdoom.GameVariable.KILLCOUNT
         )
 
-        reward_increased = end_kills > start_kills
-        health_decreased = end_health < start_health
-        armor_decreased = end_armor < start_armor
+        kill_reward = np.sign(end_kills - start_kills)
+        health_reward = np.sign(end_health - start_health)
+        armor_reward = np.sign(end_armor - start_armor)
 
-        if reward_increased:
-            return 1.0  # Win
-        elif health_decreased or armor_decreased:
-            return 0.0  # Lose (health or armor decreased)
-        else:
-            # Neutral - no change in reward, health, or armor
-            return 0.5
+        return kill_reward + 2 * health_reward + 2 * armor_reward
 
     def _backpropagate(self, node: MCTSNode, value: float) -> None:
         """Backpropagation: update statistics up the tree."""
@@ -510,14 +595,21 @@ class MCTSAgent:
         buttons = self.ACTION_TO_BUTTONS[action_name]
         self.current_game.make_action(buttons, 4)
 
-        # Create child node
+        # Capture new state
         child_state, child_save_path = self._create_state_from_game()
+
+        # Evaluate model priors for child state (will be used when selecting its children)
+        input_ids, attention_mask, depth_ids = self._prepare_model_input(child_state)
+        child_priors = self._evaluate_state(input_ids, attention_mask, depth_ids)
+
+        # Create child node with its own priors
         child = MCTSNode(
             state=child_state,
             save_path=child_save_path,
             parent=node,
             action_taken=action,
             num_actions=self.num_actions,
+            model_priors=child_priors,
         )
         node.children[action] = child
 
@@ -546,14 +638,20 @@ class MCTSAgent:
             self.run_simulation()
 
     def initialize_root(self) -> None:
-        """Create root node from current game state."""
+        """Create root node from current game state with model priors."""
         game_state, save_path = self._create_state_from_game()
+
+        # Evaluate model priors for root state
+        input_ids, attention_mask, depth_ids = self._prepare_model_input(game_state)
+        model_priors = self._evaluate_state(input_ids, attention_mask, depth_ids)
+
         self.root = MCTSNode(
             state=game_state,
             save_path=save_path,
             parent=None,
             action_taken=None,
             num_actions=self.num_actions,
+            model_priors=model_priors,
         )
 
     def get_action(self) -> Tuple[str, List[int], int]:
