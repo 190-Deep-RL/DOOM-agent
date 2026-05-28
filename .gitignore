@@ -65,3 +65,6 @@ Thumbs.db
 
 # Secret environment variables
 .env
+
+# Experiment Data
+*.csv

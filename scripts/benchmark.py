@@ -474,6 +474,16 @@ def main():
         try:
             results = run_benchmark(agent, args.scenario, args.episodes, args.frame_skip, args.realtime)
             metrics = compute_metrics(results)
+            
+            # Attach raw episode data so experiment_utils.py can log individual episodes
+            metrics['raw_episodes'] = [
+                {
+                    'steps': r['steps'],
+                    'kills': r['kills'],
+                    'avg_latency': float(np.mean(r['latencies'])) if r['latencies'] else 0.0
+                } for r in results
+            ]
+            
             all_results[agent.name] = metrics
             print(f"\n  {agent.name}: avg_survival={metrics['avg_survival_steps']:.1f}, "
                   f"avg_kills={metrics['avg_kills']:.1f}, "
