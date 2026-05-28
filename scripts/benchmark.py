@@ -306,11 +306,14 @@ class RandomAgent:
 # ================================================================
 class MCTSBenchmarkAgent :
 
-    def __init__(self, model_path, num_simulations = 25, rollout_depth = 20, exploration_constant = 1.414, use_puct = True, rollout_temperature = 0.1, prior_temperature = 0.1, batch_size= 1 ) :
+    def __init__(self, model_path, num_simulations = 25, rollout_depth = 20, exploration_constant = 1.414, use_puct = True, rollout_temperature = 0.1, prior_temperature = 0.1, batch_size = 1, use_llm_eval = False, llm_sampling_rate = 4) :
         
         import torch
         from doom_multivec.model.classifier import DoomMultiVecClassifier
         from transformers import AutoTokenizer
+
+        self.use_llm_eval = use_llm_eval
+        self.llm_sampling_rate = llm_sampling_rate
 
         # load model weights from disk — same pattern as MultiVecAgent
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -408,6 +411,8 @@ class MCTSBenchmarkAgent :
             prior_temperature=self.prior_temperature,
             use_composite_moves=True,
             composite_logit_weights=[50.0, 0.7, 0.8, 0.9],
+            use_llm_eval = self.use_llm_eval,
+            llm_sampling_rate = self.llm_sampling_rate,
 
         )
 
