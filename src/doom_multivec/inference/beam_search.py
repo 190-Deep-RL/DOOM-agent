@@ -25,6 +25,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from doom_multivec.inference.llm_value_cache import LLMValueCache, ascii_state_hash
+
 
 @dataclass
 class BeamItem:
@@ -33,6 +35,16 @@ class BeamItem:
     score: float
     metrics: Tuple[float, float, float]  # (health, armor, killcount) at end of sequence
     finished: bool = False
+    # Trajectory of (state_hash, action) along this beam, for LLM cache.
+    trajectory: List[Tuple[str, int]] = None  # type: ignore
+    # One screen frame captured at the tip (None until rated).
+    tip_frame: Optional[np.ndarray] = None
+    # LLM rating once a leaf eval has fired, or None.
+    llm_rating: Optional[float] = None
+
+    def __post_init__(self):
+        if self.trajectory is None:
+            self.trajectory = []
 
 
 class BeamSearchAgent:
@@ -90,6 +102,10 @@ class BeamSearchAgent:
         device: str = 'cpu',
         frame_skip: int = 4,
         temp_dir: Optional[str] = None,
+        llm_cache: Optional[LLMValueCache] = None,
+        llm_leaf_eval: bool = True,
+        llm_blend: float = 0.3,
+        llm_cache_blend: float = 0.15,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -106,6 +122,15 @@ class BeamSearchAgent:
         self._save_counter = 0
         self.current_game = None
         self._root_save_path: Optional[str] = None
+
+        # llm_leaf_eval forces an LLM call per surviving beam tip every
+        # decision; llm_blend weights the resulting per-beam rating into
+        # the final reranker; llm_cache_blend weights cached per-step
+        # values into intermediate step deltas during expansion.
+        self.llm_cache = llm_cache
+        self.llm_leaf_eval = llm_leaf_eval
+        self.llm_blend = llm_blend
+        self.llm_cache_blend = llm_cache_blend
 
         self._build_action_mappings()
         self.num_actions = len(self.action_names)
@@ -163,9 +188,13 @@ class BeamSearchAgent:
     # ---------- model interface ----------
 
     def _ascii_from_game(self) -> Tuple[str, Optional[list]]:
+        ascii_frame, depth_bins, _ = self._ascii_and_screen_from_game()
+        return ascii_frame, depth_bins
+
+    def _ascii_and_screen_from_game(self) -> Tuple[str, Optional[list], Optional[np.ndarray]]:
         state_obj = self.current_game.get_state()
         if state_obj is None:
-            return '', None
+            return '', None, None
         screen = state_obj.screen_buffer
         depth = state_obj.depth_buffer if hasattr(state_obj, 'depth_buffer') else None
         if screen.ndim == 3:
@@ -179,7 +208,7 @@ class BeamSearchAgent:
         else:
             ascii_frame = self.converter.convert_simple(gray)
             depth_bins = None
-        return ascii_frame, depth_bins
+        return ascii_frame, depth_bins, screen
 
     def _prepare_model_input(self, ascii_frame: str, depth_bins: Optional[list]):
         encoded = self.tokenizer(
@@ -214,6 +243,9 @@ class BeamSearchAgent:
         ascii_frame, depth_bins = self._ascii_from_game()
         if not ascii_frame:
             return None
+        return self._probs_from_ascii(ascii_frame, depth_bins)
+
+    def _probs_from_ascii(self, ascii_frame: str, depth_bins) -> np.ndarray:
         input_ids, attention_mask, depth_ids = self._prepare_model_input(ascii_frame, depth_bins)
         with torch.no_grad():
             result = self.model(input_ids, attention_mask, depth_ids=depth_ids)
@@ -241,7 +273,10 @@ class BeamSearchAgent:
         return float(kill_d + 2 * health_d + 2 * armor_d)
 
     def _rank(self, item: BeamItem) -> float:
-        return item.score + self.prior_weight * item.log_prob
+        base = item.score + self.prior_weight * item.log_prob
+        if item.llm_rating is not None:
+            base += self.llm_blend * (item.llm_rating - 0.5)
+        return base
 
     def _restore_to(self, action_sequence: List[int]) -> bool:
         """Load root + replay actions. Returns False if episode ended mid-replay."""
@@ -288,12 +323,14 @@ class BeamSearchAgent:
                         candidates.append(item)
                         continue
 
-                    # Policy at the current beam-item state.
+                    # Restore to this beam-item's state and read its ASCII once.
                     self._restore_to(item.actions)
-                    probs = self._policy_probs()
-                    if probs is None:
+                    ascii_frame, depth_bins = self._ascii_from_game()
+                    if not ascii_frame:
                         candidates.append(item)
                         continue
+                    probs = self._probs_from_ascii(ascii_frame, depth_bins)
+                    parent_hash = ascii_state_hash(ascii_frame)
 
                     top_actions = np.argsort(-probs)[:self.top_k]
                     for a in top_actions:
@@ -307,12 +344,21 @@ class BeamSearchAgent:
                         else:
                             end_metrics = self._read_metrics()
                             step_delta = self._step_score(item.metrics, end_metrics)
+
+                        # Blend cached LLM value into step delta if available.
+                        # Centered around 0.5 so a neutral cache contributes zero.
+                        if self.llm_cache is not None and self.llm_cache_blend > 0.0:
+                            cached = self.llm_cache.lookup(parent_hash, a)
+                            if cached is not None:
+                                step_delta += self.llm_cache_blend * (cached - 0.5)
+
                         candidates.append(BeamItem(
                             actions=item.actions + [a],
                             log_prob=item.log_prob + math.log(max(float(probs[a]), 1e-8)),
                             score=item.score + step_delta,
                             metrics=end_metrics,
                             finished=finished,
+                            trajectory=item.trajectory + [(parent_hash, a)],
                         ))
 
                 if not candidates:
@@ -320,6 +366,28 @@ class BeamSearchAgent:
 
                 candidates.sort(key=self._rank, reverse=True)
                 beam = candidates[:self.beam_width]
+
+            # Optional leaf eval: rate each surviving beam tip with one LLM
+            # call per beam, broadcast the rating back onto its trajectory,
+            # and update each beam's llm_rating so _rank uses it.
+            if (self.llm_cache is not None
+                    and self.llm_leaf_eval
+                    and self.llm_cache.api_key is not None
+                    and self.llm_blend > 0.0):
+                for item in beam:
+                    if item.finished or not item.actions:
+                        continue
+                    # Reach the tip and grab a frame for the LLM.
+                    self._restore_to(item.actions)
+                    _, _, screen = self._ascii_and_screen_from_game()
+                    if screen is None:
+                        continue
+                    rating = self.llm_cache.rate_trajectory(
+                        [np.array(screen, copy=True)],
+                        item.trajectory,
+                    )
+                    if rating is not None:
+                        item.llm_rating = rating
 
             beam.sort(key=self._rank, reverse=True)
             self.last_top_beams = beam[:3]

@@ -28,7 +28,38 @@ import vizdoom
 from doom_multivec.model.classifier import DoomMultiVecClassifier
 from doom_multivec.ascii.converter import AsciiConverter
 from doom_multivec.inference.beam_search import BeamSearchAgent
+from doom_multivec.inference.llm_value_cache import LLMValueCache
+from pathlib import Path
 from transformers import AutoTokenizer
+
+
+def maybe_build_llm_cache(args) -> LLMValueCache:
+    """Return an LLMValueCache iff --llm-eval is set, otherwise None."""
+    if not args.llm_eval:
+        return None
+    api_key = args.llm_api_key or os.environ.get('TRITON_API_KEY')
+    if api_key is None:
+        print("WARNING: --llm-eval set but no API key found "
+              "(--llm-api-key or TRITON_API_KEY env). Leaf eval will be skipped.")
+    rubric_text = ""
+    if args.llm_rubric:
+        rubric_text = Path(args.llm_rubric).read_text()
+    else:
+        default_rubric = Path(__file__).resolve().parent.parent / 'src' / 'doom_multivec' / 'inference' / 'rubric.txt'
+        if default_rubric.exists():
+            rubric_text = default_rubric.read_text()
+    cache = LLMValueCache(
+        api_key=api_key,
+        prompt=rubric_text or "Rate the gameplay shown 0.0 (bad) to 1.0 (good).",
+        sample_rate=0.0,  # beam doesn't use sample_rate; it forces leaf calls
+        ema_alpha=args.llm_ema_alpha,
+        credit_decay=args.llm_credit_decay,
+        verbose=args.llm_verbose,
+    )
+    if args.llm_cache_path and Path(args.llm_cache_path).exists():
+        cache.load(args.llm_cache_path)
+        print(f"Loaded LLM value cache from {args.llm_cache_path} ({len(cache)} entries)")
+    return cache
 
 
 def setup_doom(scenario='basic', visible=True, armed=False):
@@ -241,6 +272,27 @@ def main():
                         help='Temperature applied to base model logits before composite expansion')
     parser.add_argument('--no-composite-moves', action='store_true',
                         help='Disable composite (two-button) actions; use base 4 actions only')
+    # ---- LLM-value-cache flags ----
+    parser.add_argument('--llm-eval', action='store_true',
+                        help='Enable LLM-based value caching (leaf eval + cached step blending)')
+    parser.add_argument('--llm-api-key', default=None,
+                        help='Triton API key (falls back to $TRITON_API_KEY)')
+    parser.add_argument('--no-llm-leaf-eval', action='store_true',
+                        help='Skip the per-decision LLM call on surviving beam tips (only use cached lookups)')
+    parser.add_argument('--llm-blend', type=float, default=0.3,
+                        help='Weight of per-beam LLM rating in the final reranker')
+    parser.add_argument('--llm-cache-blend', type=float, default=0.15,
+                        help='Weight of cached LLM values mixed into intermediate step deltas')
+    parser.add_argument('--llm-ema-alpha', type=float, default=0.3,
+                        help='EMA step size for cache updates')
+    parser.add_argument('--llm-credit-decay', type=float, default=0.95,
+                        help='Per-step decay when broadcasting LLM rating backwards along a beam path')
+    parser.add_argument('--llm-rubric', default=None,
+                        help='Path to a rubric file (defaults to MCTS rubric.txt)')
+    parser.add_argument('--llm-cache-path', default=None,
+                        help='Load/save cache JSON at this path (persists across episodes)')
+    parser.add_argument('--llm-verbose', action='store_true',
+                        help='Print parsed LLM responses')
     parser.add_argument('--frame-skip', type=int, default=4,
                         help='Frames between decisions')
     parser.add_argument('--fps', type=int, default=30,
@@ -274,6 +326,8 @@ def main():
     game = setup_doom(args.scenario, visible=True, armed=args.armed)
     converter = AsciiConverter(width=40, height=25)
 
+    llm_cache = maybe_build_llm_cache(args)
+
     agent = BeamSearchAgent(
         model=model,
         tokenizer=tokenizer,
@@ -286,9 +340,16 @@ def main():
         use_composite_moves=not args.no_composite_moves,
         device='cpu',
         frame_skip=args.frame_skip,
+        llm_cache=llm_cache,
+        llm_leaf_eval=not args.no_llm_leaf_eval,
+        llm_blend=args.llm_blend,
+        llm_cache_blend=args.llm_cache_blend,
     )
     agent.set_game(game)
     print(f"Actions ({agent.num_actions}): {agent.action_names}")
+    if llm_cache is not None:
+        print(f"LLM eval: leaf_eval={not args.no_llm_leaf_eval}, blend={args.llm_blend}, "
+              f"cache_blend={args.llm_cache_blend}, cache_size={len(llm_cache)}")
 
     if args.live:
         game.new_episode()
@@ -349,6 +410,12 @@ def main():
                 pct = count / step * 100 if step > 0 else 0
                 bar = '#' * int(pct / 2)
                 print(f"    {action:24s}: {count:4d} ({pct:5.1f}%) {bar}")
+
+    if llm_cache is not None:
+        print(f"\nLLM cache stats: {llm_cache.stats}  (size={len(llm_cache)})")
+        if args.llm_cache_path:
+            llm_cache.save(args.llm_cache_path)
+            print(f"Saved LLM value cache to {args.llm_cache_path}")
 
     game.close()
     print("\nDone!")

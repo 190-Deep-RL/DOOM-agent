@@ -24,11 +24,15 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from doom_multivec.inference.llm_value_cache import LLMValueCache, ascii_state_hash
+
 
 @dataclass
 class RolloutResult:
     first_action: int
     score: float
+    rule_score: float = 0.0
+    llm_score: Optional[float] = None  # mean cached value over trajectory, if any
 
 
 class BestOfNAgent:
@@ -82,6 +86,9 @@ class BestOfNAgent:
         device: str = 'cpu',
         frame_skip: int = 4,
         temp_dir: Optional[str] = None,
+        llm_cache: Optional[LLMValueCache] = None,
+        llm_blend: float = 0.3,
+        llm_frames_per_rating: int = 4,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -98,6 +105,10 @@ class BestOfNAgent:
         self._save_counter = 0
         self.current_game = None
         self._root_save_path: Optional[str] = None
+
+        self.llm_cache = llm_cache
+        self.llm_blend = llm_blend
+        self.llm_frames_per_rating = llm_frames_per_rating
 
         self._build_action_mappings()
         self.num_actions = len(self.action_names)
@@ -154,9 +165,13 @@ class BestOfNAgent:
     # ---------- model interface ----------
 
     def _ascii_from_game(self) -> Tuple[str, Optional[list]]:
+        ascii_frame, depth_bins, _ = self._ascii_and_screen_from_game()
+        return ascii_frame, depth_bins
+
+    def _ascii_and_screen_from_game(self) -> Tuple[str, Optional[list], Optional[np.ndarray]]:
         state_obj = self.current_game.get_state()
         if state_obj is None:
-            return '', None
+            return '', None, None
         screen = state_obj.screen_buffer
         depth = state_obj.depth_buffer if hasattr(state_obj, 'depth_buffer') else None
         if screen.ndim == 3:
@@ -170,7 +185,7 @@ class BestOfNAgent:
         else:
             ascii_frame = self.converter.convert_simple(gray)
             depth_bins = None
-        return ascii_frame, depth_bins
+        return ascii_frame, depth_bins, screen
 
     def _prepare_model_input(self, ascii_frame: str, depth_bins: Optional[list]):
         encoded = self.tokenizer(
@@ -256,29 +271,79 @@ class BestOfNAgent:
         self._restore_to_root()
         start = self._read_metrics()
 
-        first_action = self._sample_action()
-        self.current_game.make_action(
-            self.action_to_buttons[self.action_names[first_action]],
-            self.frame_skip,
-        )
+        # Trajectory and frame collection for LLM cache. Both are no-ops
+        # when llm_cache is None; the only cost is one ascii hash per step.
+        trajectory: List[Tuple[str, int]] = []
+        llm_frames: List[np.ndarray] = []
+        # Evenly spaced frame-capture indices across the rollout.
+        capture_indices = set()
+        if self.llm_cache is not None and self.llm_frames_per_rating > 0:
+            step = max(1, self.rollout_depth // self.llm_frames_per_rating)
+            capture_indices = set(range(0, self.rollout_depth, step))
 
-        for _ in range(self.rollout_depth - 1):
+        for i in range(self.rollout_depth):
             if self.current_game.is_episode_finished():
                 break
-            a = self._sample_action()
+            ascii_frame, depth_bins, screen = self._ascii_and_screen_from_game()
+            if not ascii_frame:
+                break
+            # Sample using the just-captured policy (avoid a second forward pass).
+            probs = self._probs_from_ascii(ascii_frame, depth_bins)
+            if self.temperature != 1.0:
+                probs = np.power(probs, 1.0 / max(self.temperature, 1e-6))
+                probs = probs / probs.sum()
+            a = int(np.random.choice(self.num_actions, p=probs))
+
+            trajectory.append((ascii_state_hash(ascii_frame), a))
+            if i in capture_indices and screen is not None:
+                llm_frames.append(np.array(screen, copy=True))
+
             self.current_game.make_action(
                 self.action_to_buttons[self.action_names[a]],
                 self.frame_skip,
             )
 
         if self.current_game.is_episode_finished():
-            score = 0.0
+            rule_score = 0.0
         else:
             end = self._read_metrics()
-            score = self._score(start, end)
+            rule_score = self._score(start, end)
 
+        # Cache: query existing entries for a value blend (always free).
+        llm_value = None
+        if self.llm_cache is not None and trajectory:
+            llm_value = self.llm_cache.trajectory_value(trajectory, require_min_hits=1)
+            # Probabilistically fire a fresh LLM rating; broadcast onto path.
+            self.llm_cache.maybe_rate_trajectory(llm_frames, trajectory)
+
+        # Blend cached LLM value into the score. Cached values are in
+        # [0, 1] with 0.5 as the neutral prior, so subtract 0.5 so that a
+        # neutral cache contributes zero (preserves rule-based ranking).
+        if llm_value is not None:
+            score = rule_score + self.llm_blend * (llm_value - 0.5)
+        else:
+            score = rule_score
+
+        first_action = trajectory[0][1] if trajectory else 0
         self._record_benchmark('rollout', time.perf_counter() - rt0)
-        return RolloutResult(first_action=first_action, score=score)
+        return RolloutResult(
+            first_action=first_action,
+            score=score,
+            rule_score=rule_score,
+            llm_score=llm_value,
+        )
+
+    def _probs_from_ascii(self, ascii_frame: str, depth_bins) -> np.ndarray:
+        """Policy probs from a precomputed ASCII frame (no game state read)."""
+        input_ids, attention_mask, depth_ids = self._prepare_model_input(ascii_frame, depth_bins)
+        with torch.no_grad():
+            result = self.model(input_ids, attention_mask, depth_ids=depth_ids)
+            logits = result['logits'][0]
+            logits = self._expand_composite_logits(logits)
+            if self.prior_temperature != 1.0:
+                logits = logits / self.prior_temperature
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        return probs[:self.num_actions]
 
     # ---------- public ----------
 
