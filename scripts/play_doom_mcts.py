@@ -233,6 +233,9 @@ def run_episode_standard(args, game, agent, num_actions, episode, kills_start, s
     frame_interval = args.frame_skip / 35.0
 
     while not game.is_episode_finished():
+        if args.steps is not None and step >= args.steps:
+            print(f"\nReached max steps ({args.steps})")
+            break
         frame_start = time.perf_counter()
 
         state_start = time.perf_counter()
@@ -599,6 +602,7 @@ def main():
             print(f"  Steps: {step}")
             print(f"  Total reward: {total_reward:.0f}")
             print(f"  Kills: {kills_this_episode}")
+            print(f"  Ending Health: {game.get_game_variable(vizdoom.GameVariable.HEALTH):.0f}")
             print("  MCTS Stats:")
             if latencies:
                 print(f"    Avg decision time: {np.mean(latencies):.0f}ms")

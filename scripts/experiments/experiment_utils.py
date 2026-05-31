@@ -62,11 +62,13 @@ def parse_mcts_output(output_text):
     steps = []
     rewards = []
     kills = []
+    healths = []
     latencies = []
     
     steps_pattern = re.compile(r"Steps:\s*(\d+)")
     reward_pattern = re.compile(r"Total reward:\s*(-?\d+)")
     kills_pattern = re.compile(r"Kills:\s*(\d+)")
+    health_pattern = re.compile(r"Ending Health:\s*(\d+)")
     latency_pattern = re.compile(r"Avg decision time:\s*(\d+)ms")
     
     for line in output_text.splitlines():
@@ -81,6 +83,9 @@ def parse_mcts_output(output_text):
         m_kills = kills_pattern.search(line)
         if m_kills: kills.append(int(m_kills.group(1)))
         
+        m_health = health_pattern.search(line)
+        if m_health: healths.append(int(m_health.group(1)))
+        
         m_latency = latency_pattern.search(line)
         if m_latency: latencies.append(float(m_latency.group(1)))
 
@@ -93,6 +98,7 @@ def parse_mcts_output(output_text):
             "Steps (Survival)": steps[i],
             "Reward": rewards[i] if i < len(rewards) else 0.0,
             "Kills": kills[i] if i < len(kills) else 0.0,
+            "Ending Health": healths[i] if i < len(healths) else 0.0,
             "Latency (ms)": latencies[i] if i < len(latencies) else 0.0
         })
 
@@ -102,6 +108,7 @@ def parse_mcts_output(output_text):
         "Steps (Survival)": sum(steps) / len(steps),
         "Reward": sum(rewards) / len(rewards) if rewards else 0.0,
         "Kills": sum(kills) / len(kills) if kills else 0.0,
+        "Ending Health": sum(healths) / len(healths) if healths else 0.0,
         "Latency (ms)": sum(latencies) / len(latencies) if latencies else 0.0
     })
     
@@ -114,7 +121,7 @@ def run_baseline(episodes):
     it outputs a JSON file instead of console text. We parse that JSON here.
     """
     json_path = "temp_benchmark_results.json"
-    cmd = ["python", "scripts/benchmark.py", "--agent", "multivec", "--scenario", "deathmatch", "--episodes", str(episodes), "--output", json_path]
+    cmd = ["python", "scripts/benchmark.py", "--agent", "multivec", "--scenario", "deathmatch", "--episodes", str(episodes), "--armed", "--steps", "200", "--output", json_path]
     run_command(cmd)
     
     if os.path.exists(json_path):
@@ -134,6 +141,7 @@ def run_baseline(episodes):
                 "Steps (Survival)": ep.get('steps', 0),
                 "Reward": ep.get('kills', 0),
                 "Kills": ep.get('kills', 0),
+                "Ending Health": ep.get('health_remaining', 0.0),
                 "Latency (ms)": ep.get('avg_latency', 0.0)
             })
             
@@ -143,6 +151,7 @@ def run_baseline(episodes):
             "Steps (Survival)": metrics.get("avg_survival_steps", 0),
             "Reward": metrics.get("avg_kills", 0),
             "Kills": metrics.get("avg_kills", 0),
+            "Ending Health": sum(ep.get('health_remaining', 0.0) for ep in raw_episodes) / len(raw_episodes) if raw_episodes else 0.0,
             "Latency (ms)": metrics.get("avg_latency_ms", 0)
         })
         
@@ -155,7 +164,7 @@ def run_experiment(config_name, is_baseline, args_list, episodes, output_file):
     if is_baseline:
         episodes_data = run_baseline(episodes)
     else:
-        cmd = ["python", "scripts/play_doom_mcts.py", "--scenario", "deathmatch", "--episodes", str(episodes)] + args_list
+        cmd = ["python", "scripts/play_doom_mcts.py", "--scenario", "deathmatch", "--episodes", str(episodes), "--armed", "--steps", "200", "--batch-size", "8"] + args_list
         output = run_command(cmd)
         episodes_data = parse_mcts_output(output)
         
@@ -169,7 +178,7 @@ def run_experiment(config_name, is_baseline, args_list, episodes, output_file):
                 print(f"  Avg {k}: {v:.2f}")
             
         # Write to the CSV file
-        fieldnames = ["Configuration Name", "Episode", "Steps (Survival)", "Reward", "Kills", "Latency (ms)"]
+        fieldnames = ["Configuration Name", "Episode", "Steps (Survival)", "Reward", "Kills", "Ending Health", "Latency (ms)"]
         
         # If running the same experiment multiple times, overwrite it rather than appending 
         # so it stays clean with one average row at the bottom.
