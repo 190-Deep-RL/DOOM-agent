@@ -2,8 +2,8 @@
 
 Stateless planner: at each frame, sample N action sequences from the model
 policy (with temperature), simulate each forward H frames in VizDoom, score
-by sign(Δkills) + 2·sign(Δhealth) + 2·sign(Δarmor), and return the first
-action of the sequence(s) with the highest mean score.
+by sign(Δkills) + 2·sign(Δhealth) + 2·sign(Δarmor), and retain the first
+`retention_count` actions of the best sampled sequence.
 
 Mirrors the current MCTSAgent in three ways so results are directly comparable:
 - Composite action selection (4 base + 5 composite buttons = 9 actions).
@@ -17,7 +17,7 @@ import math
 import os
 import tempfile
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -29,7 +29,7 @@ from doom_multivec.inference.llm_value_cache import LLMValueCache, ascii_state_h
 
 @dataclass
 class RolloutResult:
-    first_action: int
+    action_sequence: Tuple[int, ...]
     score: float
     rule_score: float = 0.0
     llm_score: Optional[float] = None  # mean cached value over trajectory, if any
@@ -44,6 +44,8 @@ class BestOfNAgent:
         converter: AsciiConverter for frame preprocessing.
         num_rollouts: Number of rollouts per decision (default: 25).
         rollout_depth: Frames per rollout (default: 20).
+        retention_count: Number of leading actions from the best rollout to
+            keep and replay before planning again (default: 1).
         temperature: Softmax temperature for policy sampling (default: 0.7).
         prior_temperature: Sharpening applied to the base 4-way model logits
             before composite expansion (default: 1.0).
@@ -79,7 +81,8 @@ class BestOfNAgent:
         converter,
         num_rollouts: int = 25,
         rollout_depth: int = 20,
-        temperature: float = 0.7,
+        retention_count: int = 10,
+        temperature: float = 0.2,
         prior_temperature: float = 1.0,
         use_composite_moves: bool = True,
         composite_logit_weights: Optional[List[float]] = None,
@@ -95,16 +98,18 @@ class BestOfNAgent:
         self.converter = converter
         self.num_rollouts = num_rollouts
         self.rollout_depth = rollout_depth
+        self.retention_count = max(1, int(retention_count))
         self.temperature = temperature
         self.prior_temperature = prior_temperature
         self.use_composite_moves = use_composite_moves
-        self.composite_logit_weights = composite_logit_weights or [1.0, 1.0, 1.0, 1.0]
+        self.composite_logit_weights = composite_logit_weights or [50.0, 0.7, 1.0, 1.0]
         self.device = device
         self.frame_skip = frame_skip
         self.temp_dir = temp_dir or tempfile.gettempdir()
         self._save_counter = 0
         self.current_game = None
         self._root_save_path: Optional[str] = None
+        self._retained_actions = deque()
 
         self.llm_cache = llm_cache
         self.llm_blend = llm_blend
@@ -140,6 +145,7 @@ class BestOfNAgent:
         self._save_counter = 0
         self.last_action_stats = {}
         self._benchmark_sink = {}
+        self._retained_actions.clear()
         self._cleanup_root()
 
     def advance_root(self, action_taken: int) -> None:
@@ -324,10 +330,9 @@ class BestOfNAgent:
         else:
             score = rule_score
 
-        first_action = trajectory[0][1] if trajectory else 0
         self._record_benchmark('rollout', time.perf_counter() - rt0)
         return RolloutResult(
-            first_action=first_action,
+            action_sequence=tuple(a for _, a in trajectory),
             score=score,
             rule_score=rule_score,
             llm_score=llm_value,
@@ -351,6 +356,12 @@ class BestOfNAgent:
         if self.current_game is None:
             raise RuntimeError("Game not set. Call set_game() first.")
 
+        if self._retained_actions:
+            action_idx = int(self._retained_actions.popleft())
+            action_name = self.action_names[action_idx]
+            buttons = self.action_to_buttons[action_name]
+            return action_name, buttons, action_idx, dict(self._benchmark_sink)
+
         t0 = time.perf_counter()
         # Root snapshot taken once per decision while game is live.
         self._cleanup_root()
@@ -358,10 +369,20 @@ class BestOfNAgent:
         self.current_game.save(self._root_save_path)
 
         scores_by_action: Dict[int, list] = defaultdict(list)
+        best_result: Optional[RolloutResult] = None
         try:
-            for _ in range(self.num_rollouts):
+            for i in range(self.num_rollouts):
                 result = self._rollout_once()
-                scores_by_action[result.first_action].append(result.score)
+                # Print rollout score as it completes
+                try:
+                    print(f"Rollout {i+1}/{self.num_rollouts}: score={result.score:.2f} rule={result.rule_score:+.2f} llm={result.llm_score}")
+                except Exception:
+                    # Best-effort printing; don't crash on formatting
+                    print(f"Rollout {i+1}/{self.num_rollouts}: score={result.score}")
+                if result.action_sequence:
+                    scores_by_action[result.action_sequence[0]].append(result.score)
+                if best_result is None or result.score > best_result.score:
+                    best_result = result
         finally:
             # Always restore the live game to the real root, regardless of
             # whether any rollout finished the episode.
@@ -379,13 +400,15 @@ class BestOfNAgent:
             }
         self.last_action_stats = stats
 
-        best_action = max(
-            range(self.num_actions),
-            key=lambda a: (stats[a]['mean'], stats[a]['count']),
-        )
-        if stats[best_action]['count'] == 0:
+        if best_result is None or not best_result.action_sequence:
             probs = self._policy_probs()
             best_action = int(np.argmax(probs)) if probs is not None else 0
+            retained_actions = [best_action]
+        else:
+            best_action = int(best_result.action_sequence[0])
+            retained_actions = list(best_result.action_sequence[: self.retention_count])
+
+        self._retained_actions.extend(retained_actions[1:])
 
         action_name = self.action_names[best_action]
         buttons = self.action_to_buttons[action_name]

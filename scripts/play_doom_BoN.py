@@ -271,9 +271,9 @@ def main():
                         help='Number of rollouts per decision')
     parser.add_argument('--rollout-depth', type=int, default=20,
                         help='Frames per rollout')
-    parser.add_argument('--temperature', type=float, default=0.7,
+    parser.add_argument('--temperature', type=float, default=0.1,
                         help='Policy sampling temperature (higher = more diverse)')
-    parser.add_argument('--prior-temperature', type=float, default=1.0,
+    parser.add_argument('--prior-temperature', type=float, default=0.1,
                         help='Temperature applied to base model logits before composite expansion')
     parser.add_argument('--no-composite-moves', action='store_true',
                         help='Disable composite (two-button) actions; use base 4 actions only')
