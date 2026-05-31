@@ -104,7 +104,7 @@ class BestOfNAgent:
         self.temperature = temperature
         self.prior_temperature = prior_temperature
         self.use_composite_moves = use_composite_moves
-        self.composite_logit_weights = composite_logit_weights or [50.0, 0.5, 0.8, 0.8]
+        self.composite_logit_weights = composite_logit_weights or [50.0, 0.7, 4.0, 4.0]
         self.device = device
         self.frame_skip = frame_skip
         self.temp_dir = temp_dir or tempfile.gettempdir()
@@ -260,10 +260,7 @@ class BestOfNAgent:
         )
 
     def _score(self, start, end) -> float:
-        health_d = np.sign(end[0] - start[0])
-        armor_d = np.sign(end[1] - start[1])
-        kill_d = np.sign(end[2] - start[2])
-        return float(kill_d + 2 * health_d + 2 * armor_d)
+        return self.current_game.get_total_reward()
 
     def _restore_to_root(self) -> None:
         """Load the root snapshot and reset held buttons.

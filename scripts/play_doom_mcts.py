@@ -79,7 +79,7 @@ def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100
     game.set_hit_taken_reward(-0.2)
 
     game.init()
-    game.set_seed(1234)
+    game.set_seed(np.random.randint(0, 100000))
     return game
 
 
@@ -537,7 +537,7 @@ def main():
         rollout_temperature=args.rollout_temperature,
         prior_temperature=args.prior_temperature,
         use_composite_moves=True,
-        composite_logit_weights=[50.0, 0.7, 0.9, 0.9],  # No additional weight on composite moves
+        composite_logit_weights=[50.0, 0.7, 4.0, 4.0],  # No additional weight on composite moves
         use_llm_eval=args.use_llm_eval,
         llm_sampling_rate=args.llm_sampling_rate,
         llm_api_key=args.llm_api_key,

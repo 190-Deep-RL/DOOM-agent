@@ -102,7 +102,12 @@ def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100
     game.set_episode_timeout(episode_timeout)
     game.set_mode(vizdoom.Mode.PLAYER)
 
+    game.set_kill_reward(3.0)
+    game.set_hit_reward(1.0)
+    game.set_hit_taken_reward(-0.2)
+
     game.init()
+    game.set_seed(np.random.randint(0, 100000))
     return game
 
 
