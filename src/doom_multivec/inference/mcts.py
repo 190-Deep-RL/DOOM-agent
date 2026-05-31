@@ -91,6 +91,7 @@ class MCTSNode:
         model_priors: Optional[np.ndarray] = None,
         use_llm_eval: bool = False,
         sampling_rate: int = 1,
+        save_path: Optional[str] = None,
     ):
         self.state = state
         self.action_sequence = action_sequence  # Actions taken from root to reach this node
@@ -100,6 +101,7 @@ class MCTSNode:
         self.model_priors = model_priors
         self.use_llm_eval = use_llm_eval  # Toggle for LLM evaluation
         self.sampling_rate = sampling_rate  # Frame sampling rate for LLM eval
+        self.save_path = save_path
 
         # Tree structure
         self.children: Dict[int, 'MCTSNode'] = {}
@@ -247,6 +249,12 @@ class MCTSNode:
         self.children.clear()
         self.parent = None
         self.action_sequence = []
+        if self.save_path is not None and os.path.exists(self.save_path):
+            try:
+                os.remove(self.save_path)
+            except OSError:
+                pass
+        self.save_path = None
 
 
 class MCTSAgent:
@@ -288,6 +296,8 @@ class MCTSAgent:
         'move_forward+shoot': [1, 1, 0, 0],
         'turn_left+shoot': [1, 0, 1, 0],
         'turn_right+shoot': [1, 0, 0, 1],
+        'shoot+move_forward+turn_left': [1, 1, 1, 0],
+        'shoot+move_forward+turn_right': [1, 1, 0, 1],
     }
 
     def __init__(
@@ -363,6 +373,7 @@ class MCTSAgent:
         # Root node will be set when game starts
         self.root: Optional[MCTSNode] = None
         self.current_game = None
+        self._save_counter = 0
         # Store root state for replaying action sequences
         self._root_game_state: Optional[GameState] = None
         self._root_save_path: Optional[str] = None  # Path to saved root state
@@ -379,6 +390,10 @@ class MCTSAgent:
         })
         entry["total_ms"] += elapsed_seconds * 1000.0
         entry["count"] += 1.0
+
+    def _get_save_path(self) -> str:
+        self._save_counter += 1
+        return os.path.join(tempfile.gettempdir(), f'mcts_save_{id(self)}_{self._save_counter}.zds')
     
     def _build_action_mappings(self) -> None:
         """Build action name and button mappings based on composite moves setting."""
@@ -396,6 +411,8 @@ class MCTSAgent:
                 6: [0, 1],  # move_forward+shoot
                 7: [0, 2],  # turn_left+shoot
                 8: [0, 3],  # turn_right+shoot
+                9: [0, 1, 2],  # shoot+move_forward+turn_left
+                10: [0, 1, 3],  # shoot+move_forward+turn_right
             }
         else:
             self.composite_action_components = {}
@@ -420,11 +437,7 @@ class MCTSAgent:
         self._root_save_path = None
 
     def _create_state_from_game(self) -> GameState:
-        """Capture current game state and save to file.
-
-        Returns:
-            Tuple of (GameState, save_file_path)
-        """
+        """Capture the current game state."""
         state = self.current_game.get_state()
         if state is None:
             raise RuntimeError("Game state is None - episode may have ended")
@@ -469,6 +482,11 @@ class MCTSAgent:
         )
         return game_state
 
+    def _load_saved_state(self, save_path: str) -> None:
+        """Load a saved VizDoom state and clear any held buttons."""
+        self.current_game.load(save_path)
+        self.current_game.make_action([0, 0, 0, 0], 1)
+
     def _replay_action_sequence(self, action_sequence: List[int]) -> None:
         """Replay a sequence of actions from the start state.
         
@@ -488,13 +506,11 @@ class MCTSAgent:
         
         # Load start state
         try:
-            self.current_game.load(self._root_save_path)
+            self._load_saved_state(self._root_save_path)
             logging.debug(f"Loaded start save for replay")
         except Exception:
             logging.exception(f"Failed to load start save at {self._root_save_path}")
             return
-        
-        self.current_game.make_action([0, 0, 0, 0], 1) # Only need to reset buttons once at the start, not after every action
         
         # Replay each action in the sequence
         for action_idx in action_sequence:
@@ -517,17 +533,19 @@ class MCTSAgent:
         pass
     
     def _copy_state_for_expansion(self, node: MCTSNode) -> None:
-        """Replay action sequence to reach node's state."""
+        """Restore a node's saved state for expansion."""
         timing_start = time.perf_counter()
-
-        print(f"Length of current action sequence: {len(node.action_sequence)}")
         
         try:
-            # Replay actions from root to reach this node
-            self._replay_action_sequence(node.action_sequence)
-            logging.debug(f"Replayed {len(node.action_sequence)} actions for expansion")
+            if node.save_path is not None and os.path.exists(node.save_path):
+                self._load_saved_state(node.save_path)
+                logging.debug(f"Loaded saved state for node with {len(node.action_sequence)} actions")
+            else:
+                # Fallback for older nodes or missing snapshots.
+                self._replay_action_sequence(node.action_sequence)
+                logging.debug(f"Replayed {len(node.action_sequence)} actions for expansion")
         except Exception:
-            logging.exception("Failed to replay action sequence for expansion")
+            logging.exception("Failed to restore node state for expansion")
         finally:
             self._record_benchmark("copy_state", time.perf_counter() - timing_start)
 
@@ -731,7 +749,13 @@ class MCTSAgent:
             model_priors=child_priors,
             use_llm_eval=self.use_llm_eval,
             sampling_rate=self.llm_sampling_rate,
+            save_path=self._get_save_path(),
         )
+
+        try:
+            self.current_game.save(child.save_path)
+        except Exception:
+            logging.exception(f"Failed to save child state to {child.save_path}")
 
         node.children[action] = child
         self._record_benchmark("expand", time.perf_counter() - timing_start)
@@ -799,17 +823,13 @@ class MCTSAgent:
             vizdoom.GameVariable.KILLCOUNT
         )
 
-        kill_reward = np.sign(end_kills - start_kills)
-        health_reward = np.sign(end_health - start_health)
-        armor_reward = np.sign(end_armor - start_armor)
-
-        value = kill_reward + 2 * health_reward + 2 * armor_reward
+        value = self.current_game.get_total_reward()
+        print(f"Rollout value: {value}")
 
         # Call LLM eval if enabled
         if node.use_llm_eval and llm_frames:
             llm_value = self._evaluate_with_llm(llm_frames, node)
-            # Blend LLM eval with model-based value (can be adjusted based on preference)
-            value = 0.7 * value + 0.3 * llm_value
+            value = 2.0 * llm_value
 
         self._record_benchmark("rollout", time.perf_counter() - timing_start)
         return value
@@ -919,8 +939,12 @@ class MCTSAgent:
         """
         node, action_sequence, action = leaf_info
 
-        # Replay action sequence to reach state
-        self._replay_action_sequence(action_sequence)
+        # Restore the parent node state directly when available.
+        if node.save_path is not None and os.path.exists(node.save_path):
+            self._load_saved_state(node.save_path)
+        else:
+            # Fallback for older nodes or missing snapshots.
+            self._replay_action_sequence(action_sequence)
 
         # Take action
         action_name = self.action_names[action]
@@ -945,7 +969,13 @@ class MCTSAgent:
             model_priors=child_priors,
             use_llm_eval=self.use_llm_eval,
             sampling_rate=self.llm_sampling_rate,
+            save_path=self._get_save_path(),
         )
+
+        try:
+            self.current_game.save(child.save_path)
+        except Exception:
+            logging.exception(f"Failed to save child state to {child.save_path}")
         node.children[action] = child
 
         # Rollout
@@ -1000,6 +1030,7 @@ class MCTSAgent:
             model_priors=model_priors,
             use_llm_eval=self.use_llm_eval,
             sampling_rate=self.llm_sampling_rate,
+            save_path=self._root_save_path,
         )
         self._record_benchmark("initialize_root", time.perf_counter() - timing_start)
 

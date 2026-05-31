@@ -164,7 +164,7 @@ def run_experiment(config_name, is_baseline, args_list, episodes, output_file):
     if is_baseline:
         episodes_data = run_baseline(episodes)
     else:
-        cmd = ["python", "scripts/play_doom_mcts.py", "--scenario", "deathmatch", "--episodes", str(episodes), "--armed", "--steps", "200", "--batch-size", "8"] + args_list
+        cmd = ["python", "scripts/play_doom_mcts.py", "--scenario", "defend_the_center", "--episodes", str(episodes), "--steps", "200", "--batch-size", "8"] + args_list
         output = run_command(cmd)
         episodes_data = parse_mcts_output(output)
         

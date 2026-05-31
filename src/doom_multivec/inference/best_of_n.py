@@ -6,7 +6,7 @@ by sign(Δkills) + 2·sign(Δhealth) + 2·sign(Δarmor), and retain the first
 `retention_count` actions of the best sampled sequence.
 
 Mirrors the current MCTSAgent in three ways so results are directly comparable:
-- Composite action selection (4 base + 5 composite buttons = 9 actions).
+- Composite action selection (4 base + 7 composite buttons = 11 actions).
 - Root-replay state restoration: rollouts always restart from a single root
   snapshot rather than re-snapshotting mid-rollout (avoids the VizDoom
   save/load bleed-through when a rollout ends the episode).
@@ -49,7 +49,7 @@ class BestOfNAgent:
         temperature: Softmax temperature for policy sampling (default: 0.7).
         prior_temperature: Sharpening applied to the base 4-way model logits
             before composite expansion (default: 1.0).
-        use_composite_moves: Expand action space to include 5 composite
+        use_composite_moves: Expand action space to include 7 composite
             two-button moves (default: True).
         composite_logit_weights: Per-component weight when summing into a
             composite logit (default: [1.0, 1.0, 1.0, 1.0]).
@@ -71,6 +71,8 @@ class BestOfNAgent:
         'move_forward+shoot': [1, 1, 0, 0],
         'turn_left+shoot': [1, 0, 1, 0],
         'turn_right+shoot': [1, 0, 0, 1],
+        'shoot+move_forward+turn_left': [1, 1, 1, 0],
+        'shoot+move_forward+turn_right': [1, 1, 0, 1],
     }
     BASE_NUM_ACTIONS = 4
 
@@ -102,7 +104,7 @@ class BestOfNAgent:
         self.temperature = temperature
         self.prior_temperature = prior_temperature
         self.use_composite_moves = use_composite_moves
-        self.composite_logit_weights = composite_logit_weights or [50.0, 0.7, 1.0, 1.0]
+        self.composite_logit_weights = composite_logit_weights or [50.0, 0.5, 0.8, 0.8]
         self.device = device
         self.frame_skip = frame_skip
         self.temp_dir = temp_dir or tempfile.gettempdir()
@@ -134,6 +136,8 @@ class BestOfNAgent:
                 6: [0, 1],  # move_forward + shoot
                 7: [0, 2],  # turn_left + shoot
                 8: [0, 3],  # turn_right + shoot
+                9: [0, 1, 2],  # shoot+move_forward+turn_left
+                10: [0, 1, 3],  # shoot+move_forward+turn_right
             }
         else:
             self.composite_action_components = {}
