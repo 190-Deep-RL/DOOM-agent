@@ -35,7 +35,7 @@ if __name__ == "__main__":
     run_experiment(
         config_name="MCTS (UCB1 Only / PUCT=False)",
         is_baseline=False,
-        args_list=["--use-ucb"],  # Turns off use_puct
+        args_list=["--use-ucb", "--simulations", "10"],  # Turns off use_puct
         episodes=args.episodes,
         output_file=args.output
     )

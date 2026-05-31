@@ -64,7 +64,7 @@ def maybe_build_llm_cache(args) -> LLMValueCache:
     return cache
 
 
-def setup_doom(scenario='basic', visible=True, armed=False):
+def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100):
     """Set up VizDoom with visible window."""
     game = vizdoom.DoomGame()
 
@@ -96,7 +96,7 @@ def setup_doom(scenario='basic', visible=True, armed=False):
     game.add_available_game_variable(vizdoom.GameVariable.KILLCOUNT)
     game.add_available_game_variable(vizdoom.GameVariable.ARMOR)
 
-    game.set_episode_timeout(2100)
+    game.set_episode_timeout(episode_timeout)
     game.set_mode(vizdoom.Mode.PLAYER)
 
     game.init()
@@ -302,6 +302,8 @@ def main():
                         help='Frames between decisions')
     parser.add_argument('--fps', type=int, default=30,
                         help='Target display FPS (standard mode only)')
+    parser.add_argument('--episode-timeout', type=int, default=400,
+                        help='Episode timeout in ticks (default: 400)')
     parser.add_argument('--armed', action='store_true',
                         help='Start with plasma rifle, armor, and full ammo')
     parser.add_argument('--seed', type=int, default=None,
@@ -327,7 +329,12 @@ def main():
     if args.armed:
         print("Armed mode: Starting with plasma rifle, ammo, and armor")
 
-    game = setup_doom(args.scenario, visible=True, armed=args.armed)
+    game = setup_doom(
+        args.scenario,
+        visible=True,
+        armed=args.armed,
+        episode_timeout=args.episode_timeout,
+    )
     converter = AsciiConverter(width=40, height=25)
 
     llm_cache = maybe_build_llm_cache(args)

@@ -25,7 +25,7 @@ from experiment_utils import run_experiment
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # You can change the default number of episodes here
-    parser.add_argument("--episodes", type=int, default=3)
+    parser.add_argument("--episodes", type=int, default=10)
     # The name of the CSV file this script will generate
     parser.add_argument("--output", type=str, default="results_baseline.csv")
     args = parser.parse_args()

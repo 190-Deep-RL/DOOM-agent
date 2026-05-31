@@ -519,6 +519,8 @@ class MCTSAgent:
     def _copy_state_for_expansion(self, node: MCTSNode) -> None:
         """Replay action sequence to reach node's state."""
         timing_start = time.perf_counter()
+
+        print(f"Length of current action sequence: {len(node.action_sequence)}")
         
         try:
             # Replay actions from root to reach this node

@@ -80,7 +80,7 @@ def compute_metrics(episodes):
 # ================================================================
 # DOOM Setup
 # ================================================================
-def setup_game(scenario='defend_the_center', match_visual=False):
+def setup_game(scenario='defend_the_center', match_visual=False, visible=False):
     game = vizdoom.DoomGame()
     scenarios = {
         'basic': vizdoom.scenarios_path + '/basic.cfg',
@@ -91,7 +91,7 @@ def setup_game(scenario='defend_the_center', match_visual=False):
     game.load_config(scenarios.get(scenario, scenario))
     game.set_screen_format(vizdoom.ScreenFormat.RGB24)
     game.set_depth_buffer_enabled(True)
-    game.set_window_visible(False)
+    game.set_window_visible(visible)
     game.set_mode(vizdoom.Mode.PLAYER)
 
     if match_visual:
@@ -360,7 +360,7 @@ def arming_sequence(game):
 # ================================================================
 # Benchmark Runner
 # ================================================================
-def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed=False, max_steps=None):
+def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed=False, max_steps=None, visual=False):
     print(f"\n{'='*60}")
     print(f"  Benchmarking: {agent.name}")
     print(f"  Scenario: {scenario}")
@@ -369,9 +369,12 @@ def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed
         print(f"  Pacing: REAL-TIME (frame_skip={frame_skip} -> {frame_skip/35.0*1000:.0f}ms per decision)")
     else:
         print(f"  Pacing: as-fast-as-possible (headless)")
+    if visual:
+        print("  Display: VISIBLE window enabled")
     print(f"{'='*60}")
 
-    game = setup_game(scenario, match_visual=realtime)
+    game = setup_game(scenario, match_visual=realtime, visible=True)
+    game.set_episode_timeout(400)  # ~12 seconds max per episode to keep benchmarks fast and consistent
     results = []
     frame_interval = frame_skip / 35.0  # seconds per decision at 35 tics/sec
 
@@ -464,6 +467,8 @@ def main():
                         help='Start MCTS agent with plasma rifle, armor, and full ammo')
     parser.add_argument('--realtime', action='store_true',
                         help='Enable real-time pacing (sleep between frames like visual gameplay)')
+    parser.add_argument('--visual', action='store_true',
+                        help='Show the VizDoom game window during benchmarking')
     parser.add_argument('--output', default='benchmark_results.json')
     args = parser.parse_args()
 
@@ -492,7 +497,16 @@ def main():
 
     for name, agent in agents_to_run:
         try:
-            results = run_benchmark(agent, args.scenario, args.episodes, args.frame_skip, args.realtime, args.armed, args.steps)
+            results = run_benchmark(
+                agent,
+                args.scenario,
+                args.episodes,
+                args.frame_skip,
+                args.realtime,
+                args.armed,
+                args.steps,
+                args.visual,
+            )
             metrics = compute_metrics(results)
             
             # Attach raw episode data so experiment_utils.py can log individual episodes
