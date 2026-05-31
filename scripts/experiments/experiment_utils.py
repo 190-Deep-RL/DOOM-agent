@@ -114,14 +114,14 @@ def parse_mcts_output(output_text):
     
     return episodes_data
 
-def run_baseline(episodes):
+def run_baseline(args_list):
     """
     Special runner for the Baseline (No MCTS). 
     Since the baseline uses benchmark.py instead of play_doom_mcts.py, 
     it outputs a JSON file instead of console text. We parse that JSON here.
     """
     json_path = "temp_benchmark_results.json"
-    cmd = ["python", "scripts/benchmark.py", "--agent", "multivec", "--scenario", "deathmatch", "--episodes", str(episodes), "--armed", "--steps", "200", "--output", json_path]
+    cmd = ["python"] + args_list + ["--output", json_path]
     run_command(cmd)
     
     if os.path.exists(json_path):
@@ -162,9 +162,9 @@ def run_experiment(config_name, is_baseline, args_list, episodes, output_file):
     print(f"\n{'='*50}\nRunning {config_name} for {episodes} episodes\n{'='*50}")
     
     if is_baseline:
-        episodes_data = run_baseline(episodes)
+        episodes_data = run_baseline(args_list)
     else:
-        cmd = ["python", "scripts/play_doom_mcts.py", "--scenario", "deathmatch", "--episodes", str(episodes), "--armed", "--steps", "200", "--batch-size", "8"] + args_list
+        cmd = ["python"] + args_list
         output = run_command(cmd)
         episodes_data = parse_mcts_output(output)
         
