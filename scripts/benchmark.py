@@ -833,16 +833,26 @@ def main():
             for m in or_models:
                 agents_to_run.append((m.split('/')[-1], LLMAgent(m, base_url=openrouter_url, api_key=openrouter_key)))
 
-        for name, agent in agents_to_run:
-            try:
-                results = run_benchmark(agent, args.scenario, args.episodes, args.frame_skip, args.realtime)
-                metrics = compute_metrics(results)
-                all_results[agent.name] = metrics
-                print(f"\n  {agent.name}: avg_survival={metrics['avg_survival_steps']:.1f}, "
-                      f"avg_kills={metrics['avg_kills']:.1f} ± {metrics['kills_ci_95']:.2f}, "
-                      f"avg_latency={metrics['avg_latency_ms']:.1f}ms")
-            except Exception as e:
-                print(f"\n  {name} FAILED: {e}")
+    for name, agent in agents_to_run:
+        try:
+            results = run_benchmark(agent, args.scenario, args.episodes, args.frame_skip, args.realtime)
+            metrics = compute_metrics(results)
+            
+            # Attach raw episode data so experiment_utils.py can log individual episodes
+            metrics['raw_episodes'] = [
+                {
+                    'steps': r['steps'],
+                    'kills': r['kills'],
+                    'avg_latency': float(np.mean(r['latencies'])) if r['latencies'] else 0.0
+                } for r in results
+            ]
+            
+            all_results[agent.name] = metrics
+            print(f"\n  {agent.name}: avg_survival={metrics['avg_survival_steps']:.1f}, "
+                  f"avg_kills={metrics['avg_kills']:.1f}, "
+                  f"avg_latency={metrics['avg_latency_ms']:.1f}ms")
+        except Exception as e:
+            print(f"\n  {name} FAILED: {e}")
 
     # common output for all agent types
     print_comparison(all_results)
