@@ -779,15 +779,8 @@ class MCTSAgent:
 
         # Record starting metrics
         vizdoom = __import__('vizdoom')
-        start_health = self.current_game.get_game_variable(
-            vizdoom.GameVariable.HEALTH
-        )
-        start_armor = self.current_game.get_game_variable(
-            vizdoom.GameVariable.ARMOR
-        )
-        start_kills = self.current_game.get_game_variable(
-            vizdoom.GameVariable.KILLCOUNT
-        )
+
+        start_value = self.current_game.get_total_reward()
 
         # Collect frames for LLM eval if enabled
         llm_frames = []
@@ -811,25 +804,14 @@ class MCTSAgent:
                 # Collect frames for LLM eval based on sampling rate
                 if node.use_llm_eval and (frame_idx % node.sampling_rate == 0):
                     llm_frames.append(np.array(rollout_state.screen_buffer, copy=True))
-            
-        # Evaluate outcome
-        end_health = self.current_game.get_game_variable(
-            vizdoom.GameVariable.HEALTH
-        )
-        end_armor = self.current_game.get_game_variable(
-            vizdoom.GameVariable.ARMOR
-        )
-        end_kills = self.current_game.get_game_variable(
-            vizdoom.GameVariable.KILLCOUNT
-        )
 
-        value = self.current_game.get_total_reward()
-        print(f"Rollout value: {value}")
+        end_value = self.current_game.get_total_reward()
+        value = end_value - start_value
 
         # Call LLM eval if enabled
         if node.use_llm_eval and llm_frames:
             llm_value = self._evaluate_with_llm(llm_frames, node)
-            value = 2.0 * llm_value
+            value += 2.0 * llm_value
 
         self._record_benchmark("rollout", time.perf_counter() - timing_start)
         return value

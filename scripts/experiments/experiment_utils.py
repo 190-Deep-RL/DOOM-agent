@@ -121,7 +121,7 @@ def run_baseline(args_list):
     it outputs a JSON file instead of console text. We parse that JSON here.
     """
     json_path = "temp_benchmark_results.json"
-    cmd = ["python"] + args_list + ["--output", json_path]
+    cmd = ["python"] + args_list
     run_command(cmd)
     
     if os.path.exists(json_path):
