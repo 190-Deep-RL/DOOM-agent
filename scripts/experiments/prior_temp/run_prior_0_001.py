@@ -15,7 +15,15 @@ if __name__ == "__main__":
     run_experiment(
         config_name="MCTS Prior Temp=0.001",
         is_baseline=False,
-        args_list=["--prior-temperature", "0.001"],
+        args_list=[
+            "scripts/play_doom_mcts.py",
+            "--scenario", "deathmatch",
+            "--episodes", str(args.episodes),
+            "--armed",
+            "--steps", "200",
+            "--batch-size", "8",
+            "--prior-temperature", "0.001",
+        ],
         episodes=args.episodes,
         output_file=args.output
     )
