@@ -7,7 +7,7 @@ prior_weight * log-policy, keep top-B. After D steps, return the first
 action of the highest-scoring beam.
 
 Mirrors the current MCTSAgent in three ways so results are directly comparable:
-- Composite action selection (4 base + 5 composite buttons = 9 actions).
+- Composite action selection (4 base + 7 composite buttons = 11 actions).
 - Root-replay state restoration: a single root snapshot is taken per
   decision, and any beam item's state is reproduced by loading the root
   and replaying its action prefix. No mid-search snapshots, no
@@ -61,9 +61,9 @@ class BeamSearchAgent:
             score (default: 0.5).
         prior_temperature: Sharpening applied to the base 4-way model logits
             before composite expansion (default: 1.0).
-        use_composite_moves: Expand action space to include 5 composite
-            two-button moves (default: True). When enabled, `top_k` selects
-            from 9 actions instead of 4.
+        use_composite_moves: Expand action space to include 7 composite
+            moves (default: True). When enabled, `top_k` selects
+            from 11 actions instead of 4.
         composite_logit_weights: Per-component weight when summing into a
             composite logit (default: [1.0, 1.0, 1.0, 1.0]).
         device: Torch device for model inference.
@@ -84,6 +84,8 @@ class BeamSearchAgent:
         'move_forward+shoot': [1, 1, 0, 0],
         'turn_left+shoot': [1, 0, 1, 0],
         'turn_right+shoot': [1, 0, 0, 1],
+        'shoot+move_forward+turn_left': [1, 1, 1, 0],
+        'shoot+move_forward+turn_right': [1, 1, 0, 1],
     }
     BASE_NUM_ACTIONS = 4
 
@@ -152,6 +154,8 @@ class BeamSearchAgent:
                 6: [0, 1],  # move_forward + shoot
                 7: [0, 2],  # turn_left + shoot
                 8: [0, 3],  # turn_right + shoot
+                9: [0, 1, 2],  # shoot+move_forward+turn_left
+                10: [0, 1, 3],  # shoot+move_forward+turn_right
             }
         else:
             self.composite_action_components = {}

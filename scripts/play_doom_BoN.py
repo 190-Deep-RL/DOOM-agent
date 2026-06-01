@@ -5,11 +5,14 @@ temperature, simulates each forward H frames, and picks the first
 action of the sequence(s) with the highest mean score (same reward
 function as the MCTS planner).
 
+Supports composite two- and three-button actions in addition to the
+base 4 actions (when composite moves are enabled).
+
 Usage:
-  python scripts/play_doom_BoN.py --model models/doom-multivec-trained --scenario basic
-  python scripts/play_doom_BoN.py --model models/doom-multivec-trained --scenario deathmatch --armed \
-      --num-rollouts 50 --rollout-depth 20 --temperature 0.7
-  python scripts/play_doom_BoN.py --model models/doom-multivec-trained --scenario basic --live
+    python scripts/play_doom_BoN.py --model models/doom-multivec-trained --scenario basic
+    python scripts/play_doom_BoN.py --model models/doom-multivec-trained --scenario deathmatch --armed \
+            --num-rollouts 50 --rollout-depth 20 --temperature 0.7
+    python scripts/play_doom_BoN.py --model models/doom-multivec-trained --scenario basic --live
 """
 
 import argparse
@@ -99,7 +102,12 @@ def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100
     game.set_episode_timeout(episode_timeout)
     game.set_mode(vizdoom.Mode.PLAYER)
 
+    game.set_kill_reward(3.0)
+    game.set_hit_reward(1.0)
+    game.set_hit_taken_reward(-0.2)
+
     game.init()
+    game.set_seed(np.random.randint(0, 100000))
     return game
 
 
@@ -276,7 +284,7 @@ def main():
     parser.add_argument('--prior-temperature', type=float, default=0.1,
                         help='Temperature applied to base model logits before composite expansion')
     parser.add_argument('--no-composite-moves', action='store_true',
-                        help='Disable composite (two-button) actions; use base 4 actions only')
+                        help='Disable composite (two- and three-button) actions; use base 4 actions only')
     # ---- LLM-value-cache flags ----
     parser.add_argument('--llm-eval', action='store_true',
                         help='Enable LLM-based value caching to blend into rollout scores')

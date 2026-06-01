@@ -115,6 +115,7 @@ def setup_game(scenario='defend_the_center', match_visual=False, visible=False):
     game.add_available_game_variable(vizdoom.GameVariable.KILLCOUNT)
 
     game.init()
+    game.set_seed(np.random.randint(0, 100000))
     return game
 
 
