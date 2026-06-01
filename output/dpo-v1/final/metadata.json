@@ -1,0 +1,17 @@
+{
+  "base_model": "models/doom-multivec-5L",
+  "actor_hidden": 64,
+  "num_actions": 6,
+  "actions": [
+    "shoot",
+    "move_forward",
+    "turn_left",
+    "turn_right",
+    "strafe_left",
+    "strafe_right"
+  ],
+  "beta": 0.1,
+  "final_step": 130,
+  "train_samples": 819,
+  "eval_samples": 91
+}

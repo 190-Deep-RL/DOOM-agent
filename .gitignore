@@ -27,7 +27,10 @@ CLAUDE.md
 
 # Data and output
 data/
-output/
+output/*
+!output/dpo-v1/
+output/dpo-v1/*
+!output/dpo-v1/final/
 benchmark_*.json
 
 # Weights & Biases

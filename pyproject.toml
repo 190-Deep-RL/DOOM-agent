@@ -16,6 +16,8 @@ dependencies = [
     "Pillow",
     "datasets",
     "python-dotenv",
+    "safetensors",
+    "tqdm",
 ]
 
 [project.optional-dependencies]

@@ -5,6 +5,9 @@ Opens a DOOM window so you can watch the model play.
 Usage:
   python scripts/play_doom_visual.py --model models/doom-multivec-trained --scenario basic
   python scripts/play_doom_visual.py --model models/doom-multivec-trained --scenario defend_the_center
+
+  # With DPO-trained actor head
+  python scripts/play_doom_visual.py --model models/doom-multivec-5L --actor-head output/dpo-v1/final --scenario deathmatch --armed
 """
 
 import argparse
@@ -85,8 +88,30 @@ def setup_doom(scenario='basic', visible=True, armed=False):
     return game
 
 
-def load_model(model_path, device='cpu'):
-    """Load the trained classifier. Auto-detects num_actions from saved weights."""
+def load_model(model_path, device='cpu', actor_head_path=None):
+    """Load the trained classifier. Auto-detects num_actions from saved weights.
+
+    Args:
+        model_path: Base encoder model path.
+        device: Device to load model on.
+        actor_head_path: Optional path to DPO-trained actor head.
+    """
+    # Check if this is a DPO model (has actor_head.pt)
+    if actor_head_path or os.path.exists(os.path.join(model_path, 'actor_head.pt')):
+        # Load DPO policy
+        from doom_multivec.model.dpo_policy import DPODoomPolicy
+
+        dpo_path = actor_head_path if actor_head_path else model_path
+        print(f"Loading DPO policy from {dpo_path}")
+        model = DPODoomPolicy.from_pretrained(dpo_path, encoder_path=model_path)
+        model.eval()
+        model.to(device)
+
+        # Load tokenizer from encoder path
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        return model, tokenizer
+
+    # Original classifier loading logic
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Detect num_actions from saved state dict
@@ -161,7 +186,11 @@ def frame_to_action(model, tokenizer, converter, screen, depth, device='cpu',
         probs = torch.softmax(result['logits'], dim=-1)[0].cpu().numpy()
 
     num_actions = len(probs)
-    action_names = DoomMultiVecClassifier.ACTION_NAMES[:num_actions]
+    # Support both DoomMultiVecClassifier and DPODoomPolicy
+    if hasattr(model, 'ACTION_NAMES'):
+        action_names = model.ACTION_NAMES[:num_actions]
+    else:
+        action_names = DoomMultiVecClassifier.ACTION_NAMES[:num_actions]
     action_map = ACTION_TO_BUTTONS_4 if num_actions <= 4 else ACTION_TO_BUTTONS_6
     sorted_idx = np.argsort(probs)[::-1]
 
@@ -203,6 +232,8 @@ def frame_to_action(model, tokenizer, converter, screen, depth, device='cpu',
 def main():
     parser = argparse.ArgumentParser(description='Watch DOOM MultiVec play DOOM')
     parser.add_argument('--model', default='models/doom-multivec-trained')
+    parser.add_argument('--actor-head',
+                        help='Path to DPO-trained actor head (e.g., output/dpo-v1/final)')
     parser.add_argument('--scenario', default='defend_the_center')
     parser.add_argument('--episodes', type=int, default=3)
     parser.add_argument('--frame-skip', type=int, default=4,
@@ -216,7 +247,7 @@ def main():
     args = parser.parse_args()
 
     print("Loading model...")
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_model(args.model, actor_head_path=args.actor_head)
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
 
     print(f"\nStarting DOOM ({args.scenario})...")
@@ -224,13 +255,21 @@ def main():
         print("Armed mode: Starting with plasma rifle, ammo, and armor")
     game = setup_doom(args.scenario, visible=True, armed=args.armed)
     converter = AsciiConverter(width=40, height=25)
-    num_actions = len([p for p in model.parameters()])  # just need count
-    # Detect from model
+    # Detect num_actions from model
+    num_actions = 6  # default
     for name, param in model.named_parameters():
         if 'classifier.weight' in name:
             num_actions = param.shape[0]
             break
-    action_names = DoomMultiVecClassifier.ACTION_NAMES[:num_actions]
+        if 'actor_head' in name and param.ndim == 2 and param.shape[0] == num_actions:
+            # DPO policy final layer
+            num_actions = param.shape[0]
+            break
+
+    if hasattr(model, 'ACTION_NAMES'):
+        action_names = model.ACTION_NAMES[:num_actions]
+    else:
+        action_names = DoomMultiVecClassifier.ACTION_NAMES[:num_actions]
     print(f"Actions: {action_names}")
     top_k = 1 if args.no_composite else 2
 
