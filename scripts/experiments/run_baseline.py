@@ -33,7 +33,14 @@ if __name__ == "__main__":
     run_experiment(
         config_name="Baseline (Base Model)",
         is_baseline=True,  # Tells the utility to use benchmark.py instead of MCTS
-        args_list=[],      # No parameters needed for the baseline
+        args_list=[
+            "scripts/benchmark.py",
+            "--agent", "multivec",
+            "--scenario", "deathmatch",
+            "--episodes", str(args.episodes),
+            "--armed",
+            "--steps", "200",
+        ],
         episodes=args.episodes,
         output_file=args.output
     )
