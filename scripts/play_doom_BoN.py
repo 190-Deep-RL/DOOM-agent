@@ -97,6 +97,7 @@ def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100
     game.add_available_game_variable(vizdoom.GameVariable.HEALTH)
     game.add_available_game_variable(vizdoom.GameVariable.AMMO2)
     game.add_available_game_variable(vizdoom.GameVariable.KILLCOUNT)
+    game.add_available_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
     game.add_available_game_variable(vizdoom.GameVariable.ARMOR)
 
     game.set_episode_timeout(episode_timeout)
@@ -235,11 +236,7 @@ def run_episode_live(args, game, agent, num_actions):
     action_names = agent.action_names
     frame_times = []
 
-    while not game.is_episode_finished():
-        if args.steps is not None and step >= args.steps:
-            print(f"\nReached max steps ({args.steps})")
-            break
-
+    while step < args.steps:
         step_start = time.perf_counter()
 
         if game.get_state() is None:
@@ -424,6 +421,7 @@ def main():
         print("=" * 70)
         print(f"  Total steps: {step}")
         print(f"  Total reward: {total_reward:.0f}")
+        print(f"  Damage dealt: {damage_dealt:.0f}")
         print(f"  Final kills: {game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)}")
         print(f"  Final health: {game.get_game_variable(vizdoom.GameVariable.HEALTH)}")
         print(f"  Final armor: {game.get_game_variable(vizdoom.GameVariable.ARMOR)}")
@@ -452,7 +450,10 @@ def main():
             print(f"\n  --- Episode {episode + 1} Summary ---")
             print(f"  Steps: {step}")
             print(f"  Total reward: {total_reward:.0f}")
+            print(f"  Damage dealt: {damage_dealt:.0f}")
             print(f"  Kills: {kills_this_episode}")
+            print(f"  Ending Health: {game.get_game_variable(vizdoom.GameVariable.HEALTH):.0f}")
+            print("  BoN Stats:")
             if latencies:
                 print(f"  Avg decision time: {np.mean(latencies):.0f}ms")
 

@@ -1,0 +1,27 @@
+Given these screenshots of an agent playing DOOM, evaluate its performance.
+
+Use the following rubric to aid your judgement.
+
+Immediate Threat Management:
+- Good: The agent kept looking at all enemies. The agent shot at enemies from distance. The agent hit their shots
+- Bad: The agent has their back to enemies. They didn't shoot until they were right in front of the agent. The agent missed their shots
+
+Location:
+- Good: The agent moved around the space well. It stayed in the open space, shot at enemies, and attempted to dodge shots
+- Bad: The agent is stuck in a corner or against a wall.
+
+Long Term Planning:
+- Good: The agent positioned itself to get more kills while maximizing distance from enemies.
+- Bad: The agent placed itself in a state where it did nothing and/or where it could get shot at by enemies without retaliation
+
+Aggression:
+- Good: Goes after enemies and eliminates them at a steady rate, so that their total spawns don't overwhelm the agent
+- Bad: The agent runs into a wall, corner, or secluded area and lets the enemies continue to spawn. The agent doesn't shoot at enemies
+
+Items:
+- Good: The agent does not move towards any items since they should stay in the open and be engaging with enemies
+- Bad: The agent spends time interacting with items
+
+After rating the model, provide a comprehensive score that evaluates the agent's performance, from 0.00 (bad) to 1.00 (excellent).
+Do not give everything a 0.9-1.0, really assess the rubric and be prepared to explain your answeers. Only return a number 0-1 though
+
