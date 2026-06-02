@@ -583,7 +583,7 @@ class MCTSAgent:
         
         return expanded_logits
 
-    def _evaluate_state(self, input_ids, attention_mask, depth_ids) -> np.ndarray:
+    def _evaluate_state(self, input_ids, attention_mask, depth_ids, is_prior) -> np.ndarray:
         """Get action probabilities from the model.
 
         Applies prior_temperature to sharpen or flatten the distribution.
@@ -596,6 +596,10 @@ class MCTSAgent:
         Returns:
             Array of action probabilities
         """
+        if (is_prior and self.prior_temperature >= 10.0) or (not is_prior and self.rollout_temperature >= 10.0): 
+            uniform_probs = np.ones(self.num_actions) / self.num_actions
+            return uniform_probs
+        
         with torch.no_grad():
             result = self.model(input_ids, attention_mask, depth_ids=depth_ids)
             logits = result['logits'][0]
@@ -606,10 +610,11 @@ class MCTSAgent:
             #print dict of logits and corresponding action names for debugging
             logit_dict = {self.action_names[i]: logits[i].item() for i in range(len(self.action_names))}
             # logging.debug(f"Model logits: {logit_dict}")
-            
-            # Apply prior_temperature scaling
-            if self.prior_temperature != 1.0:
+
+            if is_prior and self.prior_temperature != 1.0:
                 logits = logits / self.prior_temperature
+            elif not is_prior and self.rollout_temperature != 1.0:
+                logits = logits / self.rollout_temperature
             
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs[:self.num_actions]
@@ -678,13 +683,10 @@ class MCTSAgent:
 
         # Get model priors for action selection
         input_ids, attention_mask, depth_ids = self._prepare_model_input(rollout_state)
-        raw_action_probs = self._evaluate_state(input_ids, attention_mask, depth_ids)
+        raw_action_probs = self._evaluate_state(input_ids, attention_mask, depth_ids, is_prior=False)
 
         # Apply temperature scaling to control exploration during rollout
         action_probs = raw_action_probs.copy()
-        if self.rollout_temperature != 1.0:
-            action_probs = np.power(action_probs, 1.0 / self.rollout_temperature)
-            action_probs = action_probs / action_probs.sum()
 
         # Sample action from model distribution
         action = np.random.choice(self.num_actions, p=action_probs)
@@ -697,6 +699,7 @@ class MCTSAgent:
         while node.is_fully_expanded() and node.children:
             node = node.best_child(self.c, use_puct=self.use_puct)
             self._save_current_frame(node.state.frame)
+        self._copy_state_for_expansion(node)
         self._record_benchmark("select", time.perf_counter() - timing_start)
         return node
 
@@ -719,8 +722,7 @@ class MCTSAgent:
             # Fallback to sequential selection
             action = node.untried_actions.pop(0)
 
-        # Replay to parent state and take action
-        self._copy_state_for_expansion(node)
+        # Take action
         action_name = self.action_names[action]
         buttons = self.action_to_buttons[action_name]
         self.current_game.make_action([0,0,0,0], 1) 
@@ -735,7 +737,8 @@ class MCTSAgent:
 
         # Evaluate model priors for child state (will be used when selecting its children)
         input_ids, attention_mask, depth_ids = self._prepare_model_input(child_state)
-        child_priors = self._evaluate_state(input_ids, attention_mask, depth_ids)
+        child_priors = self._evaluate_state(input_ids, attention_mask, depth_ids, is_prior=True)
+
 
         logging.debug(f"Expand action: {action_name}")
         # Create child node with action sequence
@@ -804,7 +807,8 @@ class MCTSAgent:
                 # Collect frames for LLM eval based on sampling rate
                 if node.use_llm_eval and (frame_idx % node.sampling_rate == 0):
                     llm_frames.append(np.array(rollout_state.screen_buffer, copy=True))
-
+            else:
+                print("Died during rollout - no state available")
         end_value = self.current_game.get_total_reward()
         value = end_value - start_value
 
@@ -812,6 +816,8 @@ class MCTSAgent:
         if node.use_llm_eval and llm_frames:
             llm_value = self._evaluate_with_llm(llm_frames, node)
             value += 2.0 * llm_value
+
+        print(f"Rollout result: {value:.2f}")
 
         self._record_benchmark("rollout", time.perf_counter() - timing_start)
         return value
@@ -886,8 +892,6 @@ class MCTSAgent:
         if self.root is None:
             raise ValueError("Root node not initialized. Call initialize_root() first.")
 
-        # Always leave simulation with root state loaded so rollout actions do
-        # not leak into live gameplay.
         try:
             if self.save_images:
                 self.image_save_index = 0
@@ -901,12 +905,13 @@ class MCTSAgent:
 
             # Rollout (only if game still running)
             if self.current_game.is_episode_finished():
-                value = 0.5  # Episode ended
+                value = 0.0
             else:
                 value = self._rollout(node)
 
             # Backpropagation
             self._backpropagate(node, value)
+            
         finally:
             self._record_benchmark("run_simulation", time.perf_counter() - timing_start)
 
@@ -938,7 +943,7 @@ class MCTSAgent:
 
         # Evaluate model priors for child state (will be used when selecting its children)
         input_ids, attention_mask, depth_ids = self._prepare_model_input(child_state)
-        child_priors = self._evaluate_state(input_ids, attention_mask, depth_ids)
+        child_priors = self._evaluate_state(input_ids, attention_mask, depth_ids, is_prior=True)
 
         # Create child node with action sequence
         child_action_sequence = action_sequence + [action]
@@ -962,7 +967,7 @@ class MCTSAgent:
 
         # Rollout
         if self.current_game.is_episode_finished():
-            value = 0.5
+            value = 0.0
         else:
             value = self._rollout(child)
 
@@ -1001,7 +1006,7 @@ class MCTSAgent:
 
         # Evaluate model priors for root state
         input_ids, attention_mask, depth_ids = self._prepare_model_input(game_state)
-        model_priors = self._evaluate_state(input_ids, attention_mask, depth_ids)
+        model_priors = self._evaluate_state(input_ids, attention_mask, depth_ids, is_prior=True)
 
         self.root = MCTSNode(
             state=game_state,
@@ -1016,11 +1021,12 @@ class MCTSAgent:
         )
         self._record_benchmark("initialize_root", time.perf_counter() - timing_start)
 
-    def get_action(self) -> Tuple[str, List[int], int, Dict[str, Dict[str, float]]]:
+    def get_action(self) -> Tuple[str, List[int], int, Dict[str, Dict[str, float]], int, float]:
         """Run MCTS and return the best action.
 
         Returns:
-            Tuple of (action_name, button_vector, action_index, benchmark_times)
+            Tuple of (action_name, button_vector, action_index, benchmark_times,
+            rollout_kills, rollout_damage)
         """
         benchmark_times: Dict[str, Dict[str, float]] = {
             "initialize_root": {"total_ms": 0.0, "count": 0.0},
@@ -1033,6 +1039,11 @@ class MCTSAgent:
         }
         self._benchmark_sink = benchmark_times
 
+        start_kills = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.KILLCOUNT)
+        start_damage = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.DAMAGECOUNT)
+
+        last_simulation_kills = start_kills
+        last_simulation_damage = start_damage
         try:
             if self.root is None:
                 self.initialize_root()
@@ -1042,6 +1053,10 @@ class MCTSAgent:
                 self.run_simulations_batched()
             else:
                 for _ in range(self.num_simulations):
+                    if(self.current_game.is_episode_finished()):
+                        break
+                    last_simulation_kills = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.KILLCOUNT)
+                    last_simulation_damage = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.DAMAGECOUNT)
                     self.run_simulation()
 
             # Select best action (most visits)
@@ -1055,15 +1070,22 @@ class MCTSAgent:
             action_name = self.action_names[best_action]
             buttons = self.action_to_buttons[action_name]
 
-            # Ensure caller executes chosen action from real/root game state.
-            # Not necessary to load root state here since we always end simulations with root state loaded,
+            # Ensure caller executes chosen action from the MCTS start state.
+            # Already loaded after each simulation above.
             # self._copy_state_for_expansion(self.root)
+
+            last_simulation_kills = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.KILLCOUNT) - last_simulation_kills
+            last_simulation_damage = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.DAMAGECOUNT) - last_simulation_damage
+            end_kills = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.KILLCOUNT)
+            end_damage = self.current_game.get_game_variable(__import__('vizdoom').GameVariable.DAMAGECOUNT)
+            rollout_kills = int(max(0.0, end_kills - start_kills))
+            rollout_damage = float(max(0.0, end_damage - start_damage))
 
             for entry in benchmark_times.values():
                 count = int(entry["count"])
                 entry["avg_ms"] = entry["total_ms"] / count if count else 0.0
 
-            return action_name, buttons, best_action, benchmark_times
+            return action_name, buttons, best_action, benchmark_times, rollout_kills, rollout_damage, last_simulation_kills, last_simulation_damage
         finally:
             self._benchmark_sink = None
 

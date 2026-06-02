@@ -97,6 +97,7 @@ def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100
     game.add_available_game_variable(vizdoom.GameVariable.HEALTH)
     game.add_available_game_variable(vizdoom.GameVariable.AMMO2)
     game.add_available_game_variable(vizdoom.GameVariable.KILLCOUNT)
+    game.add_available_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
     game.add_available_game_variable(vizdoom.GameVariable.ARMOR)
 
     game.set_episode_timeout(episode_timeout)
@@ -159,6 +160,7 @@ def format_bon_stats(stats: dict, action_names: List[str]) -> List[str]:
 def run_episode_standard(args, game, agent, num_actions, episode):
     step = 0
     total_reward = 0.0
+    damage_dealt = 0.0
     action_counter = Counter()
     latencies = []
     enemy_kills = Counter()
@@ -172,15 +174,23 @@ def run_episode_standard(args, game, agent, num_actions, episode):
         if game.get_state() is None:
             break
 
+        damage_before_rollout = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
+
         t0 = time.perf_counter()
         action_name, buttons, action_idx, _bench = agent.get_action()
         decision_time = (time.perf_counter() - t0) * 1000
         latencies.append(decision_time)
 
+        damage_after_rollout = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
+        rollout_damage = max(0.0, damage_after_rollout - damage_before_rollout)
+
         reward = game.make_action(buttons, args.frame_skip)
         total_reward += reward
         if reward > 0:
             enemy_kills[reward] += 1
+
+        damage_after_action = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
+        damage_dealt += max(0.0, damage_after_action - damage_before_rollout - rollout_damage)
 
         action_counter[action_name] += 1
         step += 1
@@ -199,23 +209,20 @@ def run_episode_standard(args, game, agent, num_actions, episode):
         if elapsed < frame_interval:
             time.sleep(frame_interval - elapsed)
 
-    return step, total_reward, action_counter, enemy_kills, latencies, kills_start
+    return step, total_reward, damage_dealt, action_counter, enemy_kills, latencies, kills_start
 
 
 def run_episode_live(args, game, agent, num_actions):
     step = 0
     total_reward = 0.0
+    damage_dealt = 0.0
     action_history: List[str] = []
     latencies = []
     enemy_kills = Counter()
     action_names = agent.action_names
     frame_times = []
 
-    while not game.is_episode_finished():
-        if args.steps is not None and step >= args.steps:
-            print(f"\nReached max steps ({args.steps})")
-            break
-
+    while step < args.steps:
         step_start = time.perf_counter()
 
         if game.get_state() is None:
@@ -224,16 +231,23 @@ def run_episode_live(args, game, agent, num_actions):
         health = game.get_game_variable(vizdoom.GameVariable.HEALTH)
         armor = game.get_game_variable(vizdoom.GameVariable.ARMOR)
         kills = game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)
+        damage_before_rollout = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
 
         t0 = time.perf_counter()
         action_name, buttons, action_idx, _bench = agent.get_action()
         decision_time = (time.perf_counter() - t0) * 1000
         latencies.append(decision_time)
 
+        damage_after_rollout = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
+        rollout_damage = max(0.0, damage_after_rollout - damage_before_rollout)
+
         reward = game.make_action(buttons, args.frame_skip)
         total_reward += reward
         if reward > 0:
             enemy_kills[reward] += 1
+
+        damage_after_action = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
+        damage_dealt += max(0.0, damage_after_action - damage_before_rollout - rollout_damage)
 
         action_history.append(action_name)
         step += 1
@@ -262,7 +276,7 @@ def run_episode_live(args, game, agent, num_actions):
             print(f"    {a}")
         print("=" * 70)
 
-    return step, total_reward, Counter(action_history), enemy_kills, latencies
+    return step, total_reward, damage_dealt, Counter(action_history), enemy_kills, latencies
 
 
 def main():
@@ -375,7 +389,7 @@ def main():
         if args.armed:
             arming_sequence(game)
 
-        step, total_reward, action_counter, enemy_kills, latencies = run_episode_live(
+        step, total_reward, damage_dealt, action_counter, enemy_kills, latencies = run_episode_live(
             args, game, agent, num_actions
         )
 
@@ -384,6 +398,7 @@ def main():
         print("=" * 70)
         print(f"  Total steps: {step}")
         print(f"  Total reward: {total_reward:.0f}")
+        print(f"  Damage dealt: {damage_dealt:.0f}")
         print(f"  Final kills: {game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)}")
         print(f"  Final health: {game.get_game_variable(vizdoom.GameVariable.HEALTH)}")
         print(f"  Final armor: {game.get_game_variable(vizdoom.GameVariable.ARMOR)}")
@@ -403,7 +418,7 @@ def main():
                 arming_sequence(game)
 
             print(f"\n{'='*60}\nEpisode {episode + 1}/{args.episodes}\n{'='*60}")
-            step, total_reward, action_counter, enemy_kills, latencies, kills_start = (
+            step, total_reward, damage_dealt, action_counter, enemy_kills, latencies, kills_start = (
                 run_episode_standard(args, game, agent, num_actions, episode)
             )
 
@@ -413,7 +428,10 @@ def main():
             print(f"\n  --- Episode {episode + 1} Summary ---")
             print(f"  Steps: {step}")
             print(f"  Total reward: {total_reward:.0f}")
+            print(f"  Damage dealt: {damage_dealt:.0f}")
             print(f"  Kills: {kills_this_episode}")
+            print(f"  Ending Health: {game.get_game_variable(vizdoom.GameVariable.HEALTH):.0f}")
+            print("  BoN Stats:")
             if latencies:
                 print(f"  Avg decision time: {np.mean(latencies):.0f}ms")
 

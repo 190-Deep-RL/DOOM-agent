@@ -32,14 +32,14 @@ if __name__ == "__main__":
 
     run_experiment(
         config_name="Baseline (Base Model)",
-        is_baseline=True,  # Tells the utility to use benchmark.py instead of MCTS
+        is_baseline=True,  
         args_list=[
             "scripts/play_doom_mcts.py",
             "--scenario", "deathmatch",
             "--episodes", str(args.episodes),
             "--armed",
-            "--simulations", "1",
-            "--depth", "1"
+            "--simulations", "5",
+            "--depth", "1",
             "--steps", "100",
         ],
         episodes=args.episodes,

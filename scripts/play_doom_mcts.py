@@ -76,7 +76,7 @@ def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100
 
     game.set_kill_reward(3.0)
     game.set_hit_reward(1.0)
-    game.set_hit_taken_reward(-0.2)
+    #game.set_hit_taken_reward(-0.2)
 
     game.init()
     return game
@@ -222,11 +222,13 @@ def run_episode_standard(args, game, agent, num_actions, episode, kills_start, s
     """Run a single episode in standard (non-live) mode.
 
     Returns:
-        Tuple of (step_count, total_reward, action_counter, latencies)
+        Tuple of (step_count, total_reward, damage_dealt, kills_dealt, action_counter, latencies, simulation_times,
+        state_times, action_times, advance_times, step_times)
     """
     step = 0
     total_reward = 0.0
     damage_dealt = 0.0
+    kills_dealt = 0.0
     action_counter = Counter()
     latencies = []
     simulation_times = []
@@ -237,10 +239,7 @@ def run_episode_standard(args, game, agent, num_actions, episode, kills_start, s
 
     frame_interval = args.frame_skip / 35.0
 
-    while not game.is_episode_finished():
-        if args.steps is not None and step >= args.steps:
-            print(f"\nReached max steps ({args.steps})")
-            break
+    while step < args.steps:
         frame_start = time.perf_counter()
 
         state_start = time.perf_counter()
@@ -250,16 +249,15 @@ def run_episode_standard(args, game, agent, num_actions, episode, kills_start, s
         health = game.get_game_variable(vizdoom.GameVariable.HEALTH)
         kills = game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)
         damage_before_rollout = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
+        kills_before_rollout = game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)
         state_time = (time.perf_counter() - state_start) * 1000
 
         # Run MCTS to select action
         t0 = time.perf_counter()
-        action_name, buttons, action_idx, benchmark_times = agent.get_action()
+        action_name, buttons, action_idx, benchmark_times, rollout_kills, rollout_damage, last_simulation_kills, last_simulation_damage = agent.get_action()
         mcts_time = (time.perf_counter() - t0) * 1000
         latencies.append(mcts_time)
         simulation_times.append(mcts_time / args.simulations)
-        damage_after_rollout = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
-        rollout_damage = max(0.0, damage_after_rollout - damage_before_rollout)
 
         # Execute action in game
         action_start = time.perf_counter()
@@ -268,6 +266,13 @@ def run_episode_standard(args, game, agent, num_actions, episode, kills_start, s
         total_reward += reward
         damage_after_action = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
         damage_dealt += max(0.0, damage_after_action - damage_before_rollout - rollout_damage)
+        kills_after_action = game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)
+        kills_dealt += max(0.0, kills_after_action - kills_before_rollout - rollout_kills)
+
+        if(game.is_episode_finished()):
+            print(f"Adding last simulation kills/damage: {last_simulation_kills} kills, {last_simulation_damage} damage")
+            damage_dealt += last_simulation_damage
+            kills_dealt += last_simulation_kills
 
         # Advance MCTS tree
         advance_start = time.perf_counter()
@@ -276,7 +281,7 @@ def run_episode_standard(args, game, agent, num_actions, episode, kills_start, s
 
         action_counter[action_name] += 1
         step += 1
-
+        
         # Print stats periodically
         if step % 10 == 1:
             health = health if not game.is_episode_finished() else 0
@@ -320,7 +325,7 @@ def run_episode_standard(args, game, agent, num_actions, episode, kills_start, s
         if elapsed < frame_interval:
             time.sleep(frame_interval - elapsed)
 
-    return step, total_reward, damage_dealt, action_counter, latencies, simulation_times, state_times, action_times, advance_times, step_times
+    return step, total_reward, damage_dealt, kills_dealt, action_counter, latencies, simulation_times, state_times, action_times, advance_times, step_times
 
 
 def run_episode_live(args, game, agent, num_actions, episode, show_timing=False):
@@ -364,13 +369,9 @@ def run_episode_live(args, game, agent, num_actions, episode, show_timing=False)
 
         # Run MCTS to select action
         t0 = time.perf_counter()
-        action_name, buttons, action_idx, benchmark_times = agent.get_action()
+        action_name, buttons, action_idx, benchmark_times, rollout_kills, rollout_damage = agent.get_action()
         mcts_time = (time.perf_counter() - t0) * 1000
         latencies.append(mcts_time)
-        damage_after_rollout = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
-        rollout_damage = max(0.0, damage_after_rollout - damage_before_rollout)
-
-        # Execute action
         action_start = time.perf_counter()
         reward = game.make_action(buttons, args.frame_skip)
         action_time = (time.perf_counter() - action_start) * 1000
@@ -538,8 +539,8 @@ def main():
         rollout_temperature=args.rollout_temperature,
         prior_temperature=args.prior_temperature,
         use_composite_moves=True,
-        composite_logit_weights=[50.0, 0.7, 7.0, 7.0],  # No additional weight on composite moves
-        use_llm_eval=args.use_llm_eval,
+        composite_logit_weights=[50.0, 0.7, 5.0, 5.0],  # No additional weight on composite moves
+        use_llm_eval=args.use_llm_eval, 
         llm_sampling_rate=args.llm_sampling_rate,
         llm_api_key=args.llm_api_key,
         llm_prompt=args.llm_prompt,
@@ -605,17 +606,14 @@ def main():
             print(f"{'='*60}")
 
             results = run_episode_standard(args, game, agent, num_actions, episode, kills_start, show_timing=args.time)
-            step, total_reward, damage_dealt, action_counter, latencies, simulation_times, state_times, action_times, advance_times, step_times = results
+            step, total_reward, damage_dealt, kills_dealt, action_counter, latencies, simulation_times, state_times, action_times, advance_times, step_times = results
 
             # Episode summary
-            kills_end = game.get_game_variable(vizdoom.GameVariable.KILLCOUNT)
-            kills_this_episode = int(kills_end) - int(kills_start)
-
             print(f"\n  --- Episode {episode + 1} Summary ---")
             print(f"  Steps: {step}")
             print(f"  Total reward: {total_reward:.0f}")
             print(f"  Damage dealt: {damage_dealt:.0f}")
-            print(f"  Kills: {kills_this_episode}")
+            print(f"  Kills: {kills_dealt:.0f}")
             print(f"  Ending Health: {game.get_game_variable(vizdoom.GameVariable.HEALTH):.0f}")
             print("  MCTS Stats:")
             if latencies:
