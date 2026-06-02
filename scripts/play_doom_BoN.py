@@ -112,7 +112,33 @@ def setup_doom(scenario='basic', visible=True, armed=False, episode_timeout=2100
     return game
 
 
-def load_model(model_path, device='cpu'):
+def load_model(model_path, device='cpu', actor_head_path=None):
+    """Load the trained classifier or DPO policy. Auto-detects num_actions from saved weights.
+
+    Args:
+        model_path: Base encoder model path.
+        device: Device to load model on.
+        actor_head_path: Optional path to DPO-trained actor head.
+    """
+    from doom_multivec.model.dpo_policy import DPODoomPolicy
+
+    # Check if loading DPO policy (actor head)
+    if actor_head_path or os.path.exists(os.path.join(model_path, 'actor_head.pt')):
+        # Load DPO policy
+        dpo_path = actor_head_path if actor_head_path else model_path
+        print(f"Loading DPO policy from {dpo_path}")
+        model = DPODoomPolicy.from_pretrained(dpo_path, encoder_path=model_path)
+        model.eval()
+        model.to(device)
+
+        # Load tokenizer from encoder path
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        # Determine num_actions from model
+        num_actions = model.num_actions
+        return model, tokenizer, num_actions
+
+    # Original classifier loading logic
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     state = torch.load(os.path.join(model_path, 'model.pt'), map_location=device)
     num_actions = 4
@@ -306,6 +332,8 @@ def main():
     parser = argparse.ArgumentParser(description='Play DOOM with Best-of-N policy rollouts')
     parser.add_argument('--model', default='models/doom-multivec-trained',
                         help='Path to trained model')
+    parser.add_argument('--actor-head',
+                        help='Path to DPO-trained actor head (e.g., output/dpo-v1/final)')
     parser.add_argument('--scenario', default='defend_the_center',
                         help='DOOM scenario to play')
     parser.add_argument('--episodes', type=int, default=3,
@@ -362,7 +390,7 @@ def main():
         torch.manual_seed(args.seed)
 
     print("Loading model...")
-    model, tokenizer, num_actions = load_model(args.model)
+    model, tokenizer, num_actions = load_model(args.model, actor_head_path=args.actor_head)
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
 
     print(f"\nStarting DOOM ({args.scenario})...")

@@ -389,6 +389,284 @@ class RandomAgent:
         return action, ACTION_BUTTONS[action]
 
 
+# ================================================================
+# Agent: MCTS (Monte Carlo Tree Search)
+# ================================================================
+class MCTSAgentBenchmark:
+    """MCTS agent wrapper for benchmarking."""
+
+    def __init__(self, model_path, actor_head_path=None, simulations=25, depth=20, exploration=1.414, batch_size=1):
+        from doom_multivec.model.classifier import DoomMultiVecClassifier
+        from doom_multivec.model.dpo_policy import DPODoomPolicy
+        from doom_multivec.inference.mcts import MCTSAgent
+        from transformers import AutoTokenizer
+        import torch
+
+        self.converter = AsciiConverter(width=40, height=25)
+        self.simulations = simulations
+        self.depth = depth
+        self.exploration = exploration
+        self.batch_size = batch_size
+
+        # Check if loading DPO policy
+        if actor_head_path or os.path.exists(os.path.join(model_path, 'actor_head.pt')):
+            dpo_path = actor_head_path if actor_head_path else model_path
+            self.model = DPODoomPolicy.from_pretrained(dpo_path, encoder_path=model_path)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.num_actions = self.model.num_actions
+            self.is_dpo = True
+            suffix = "-DPO" if actor_head_path else ""
+            self.name = f"MCTS{suffix}-{simulations}sim-{depth}d"
+        else:
+            # Load standard classifier
+            state = torch.load(os.path.join(model_path, 'model.pt'), map_location='cpu')
+            num_actions = 4
+            for key in state:
+                if 'classifier.weight' in key:
+                    num_actions = state[key].shape[0]
+                    break
+            self.model = DoomMultiVecClassifier(model_path, pool_mode='attention', num_actions=num_actions)
+            self.model.load_state_dict(state)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.num_actions = num_actions
+            self.is_dpo = False
+            self.name = f"MCTS-{simulations}sim-{depth}d"
+
+        self.mcts_agent = None
+        self.game = None
+
+    def set_game(self, game):
+        """Set the game and initialize MCTS agent."""
+        self.game = game
+        from doom_multivec.inference.mcts import MCTSAgent
+        self.mcts_agent = MCTSAgent(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            converter=self.converter,
+            num_simulations=self.simulations,
+            rollout_depth=self.depth,
+            exploration_constant=self.exploration,
+            num_actions=self.num_actions,
+            device='cpu',
+            batch_size=self.batch_size,
+        )
+        self.mcts_agent.set_game(game)
+
+    def reset(self):
+        """Reset MCTS agent for new episode."""
+        if self.mcts_agent:
+            self.mcts_agent.reset()
+
+    def advance_root(self, action_idx):
+        """Advance MCTS tree root."""
+        if self.mcts_agent:
+            self.mcts_agent.advance_root(action_idx)
+
+    def get_action(self, screen, depth):
+        """Get action from MCTS agent."""
+        if self.mcts_agent is None:
+            return 'move_forward', ACTION_BUTTONS['move_forward']
+
+        action_name, buttons, action_idx, _, _, _, _, _ = self.mcts_agent.get_action()
+        return action_name, buttons, action_idx
+
+
+# ================================================================
+# Agent: Best-of-N (BoN)
+# ================================================================
+class BoNAgentBenchmark:
+    """Best-of-N agent wrapper for benchmarking."""
+
+    def __init__(self, model_path, actor_head_path=None, num_rollouts=25, rollout_depth=20, temperature=0.1,
+                 llm_eval=False, llm_api_key=None, llm_sample_rate=0.05, llm_blend=0.3,
+                 llm_cache_path=None, llm_verbose=False):
+        from doom_multivec.model.classifier import DoomMultiVecClassifier
+        from doom_multivec.model.dpo_policy import DPODoomPolicy
+        from doom_multivec.inference.best_of_n import BestOfNAgent
+        from doom_multivec.inference.llm_value_cache import LLMValueCache
+        from transformers import AutoTokenizer
+        from pathlib import Path
+        import torch
+
+        self.converter = AsciiConverter(width=40, height=25)
+        self.num_rollouts = num_rollouts
+        self.rollout_depth = rollout_depth
+        self.temperature = temperature
+
+        # Build LLM cache if enabled
+        self.llm_cache = None
+        if llm_eval:
+            api_key = llm_api_key or os.environ.get('TRITON_API_KEY')
+            if api_key is None:
+                print("WARNING: BoN LLM eval enabled but no API key found")
+            # Default rubric
+            default_rubric = Path(__file__).resolve().parent / '..' / 'src' / 'doom_multivec' / 'inference' / 'rubric.txt'
+            rubric_text = ""
+            if default_rubric.exists():
+                rubric_text = default_rubric.read_text()
+            self.llm_cache = LLMValueCache(
+                api_key=api_key,
+                prompt=rubric_text or "Rate the gameplay shown 0.0 (bad) to 1.0 (good).",
+                sample_rate=llm_sample_rate,
+                ema_alpha=0.3,
+                credit_decay=0.95,
+                verbose=llm_verbose,
+            )
+            if llm_cache_path and Path(llm_cache_path).exists():
+                self.llm_cache.load(llm_cache_path)
+                print(f"Loaded LLM cache from {llm_cache_path} ({len(self.llm_cache)} entries)")
+
+        # Check if loading DPO policy
+        if actor_head_path or os.path.exists(os.path.join(model_path, 'actor_head.pt')):
+            dpo_path = actor_head_path if actor_head_path else model_path
+            self.model = DPODoomPolicy.from_pretrained(dpo_path, encoder_path=model_path)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.num_actions = self.model.num_actions
+            self.is_dpo = True
+            suffix = "-DPO" if actor_head_path else ""
+            llm_suffix = "-LLM" if llm_eval else ""
+            self.name = f"BoN{suffix}{llm_suffix}-{num_rollouts}r-{rollout_depth}d"
+        else:
+            # Load standard classifier
+            state = torch.load(os.path.join(model_path, 'model.pt'), map_location='cpu')
+            num_actions = 4
+            for key in state:
+                if 'classifier.weight' in key:
+                    num_actions = state[key].shape[0]
+                    break
+            self.model = DoomMultiVecClassifier(model_path, pool_mode='attention', num_actions=num_actions)
+            self.model.load_state_dict(state)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.num_actions = num_actions
+            self.is_dpo = False
+            llm_suffix = "-LLM" if llm_eval else ""
+            self.name = f"BoN{llm_suffix}-{num_rollouts}r-{rollout_depth}d"
+
+        self.bon_agent = None
+        self.game = None
+        self.llm_blend = llm_blend
+
+    def set_game(self, game):
+        """Set the game and initialize BoN agent."""
+        self.game = game
+        from doom_multivec.inference.best_of_n import BestOfNAgent
+        self.bon_agent = BestOfNAgent(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            converter=self.converter,
+            num_rollouts=self.num_rollouts,
+            rollout_depth=self.rollout_depth,
+            temperature=self.temperature,
+            device='cpu',
+            llm_cache=self.llm_cache,
+            llm_blend=self.llm_blend,
+        )
+        self.bon_agent.set_game(game)
+
+    def reset(self):
+        """Reset BoN agent for new episode."""
+        if self.bon_agent:
+            self.bon_agent.reset()
+
+    def advance_root(self, action_idx):
+        """Advance BoN tree root."""
+        if self.bon_agent:
+            self.bon_agent.advance_root(action_idx)
+
+    def get_action(self, screen, depth):
+        """Get action from BoN agent."""
+        if self.bon_agent is None:
+            return 'move_forward', ACTION_BUTTONS['move_forward']
+
+        action_name, buttons, action_idx, _, _, _ = self.bon_agent.get_action()
+        return action_name, buttons, action_idx
+
+
+# ================================================================
+# Agent: Beam Search
+# ================================================================
+class BeamAgentBenchmark:
+    """Beam search agent wrapper for benchmarking."""
+
+    def __init__(self, model_path, actor_head_path=None, beam_width=4, beam_depth=8, top_k=2):
+        from doom_multivec.model.classifier import DoomMultiVecClassifier
+        from doom_multivec.model.dpo_policy import DPODoomPolicy
+        from doom_multivec.inference.beam_search import BeamSearchAgent
+        from transformers import AutoTokenizer
+        import torch
+
+        self.converter = AsciiConverter(width=40, height=25)
+        self.beam_width = beam_width
+        self.beam_depth = beam_depth
+        self.top_k = top_k
+
+        # Check if loading DPO policy
+        if actor_head_path or os.path.exists(os.path.join(model_path, 'actor_head.pt')):
+            dpo_path = actor_head_path if actor_head_path else model_path
+            self.model = DPODoomPolicy.from_pretrained(dpo_path, encoder_path=model_path)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.num_actions = self.model.num_actions
+            self.is_dpo = True
+            suffix = "-DPO" if actor_head_path else ""
+            self.name = f"Beam{suffix}-{beam_width}w-{beam_depth}d"
+        else:
+            # Load standard classifier
+            state = torch.load(os.path.join(model_path, 'model.pt'), map_location='cpu')
+            num_actions = 4
+            for key in state:
+                if 'classifier.weight' in key:
+                    num_actions = state[key].shape[0]
+                    break
+            self.model = DoomMultiVecClassifier(model_path, pool_mode='attention', num_actions=num_actions)
+            self.model.load_state_dict(state)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.num_actions = num_actions
+            self.is_dpo = False
+            self.name = f"Beam-{beam_width}w-{beam_depth}d"
+
+        self.beam_agent = None
+        self.game = None
+
+    def set_game(self, game):
+        """Set the game and initialize Beam agent."""
+        self.game = game
+        from doom_multivec.inference.beam_search import BeamSearchAgent
+        self.beam_agent = BeamSearchAgent(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            converter=self.converter,
+            beam_width=self.beam_width,
+            beam_depth=self.beam_depth,
+            top_k=self.top_k,
+            device='cpu',
+        )
+        self.beam_agent.set_game(game)
+
+    def reset(self):
+        """Reset Beam agent for new episode."""
+        if self.beam_agent:
+            self.beam_agent.reset()
+
+    def advance_root(self, action_idx):
+        """Advance Beam tree root."""
+        if self.beam_agent:
+            self.beam_agent.advance_root(action_idx)
+
+    def get_action(self, screen, depth):
+        """Get action from Beam agent."""
+        if self.beam_agent is None:
+            return 'move_forward', ACTION_BUTTONS['move_forward']
+
+        action_name, buttons, action_idx, _ = self.beam_agent.get_action()
+        return action_name, buttons, action_idx
+
+
 def arming_sequence(game):
     for _ in range(5):
         game.advance_action(1)
@@ -405,6 +683,102 @@ def arming_sequence(game):
 
 # ================================================================
 # Benchmark Runner
+# ================================================================
+# ================================================================
+# Technique-based Benchmark Runner (for MCTS/BoN/Beam agents)
+# ================================================================
+def run_benchmark_technique(agent, scenario, episodes, frame_skip=4, realtime=False, armed=False, max_steps=None):
+    """Run benchmark for technique-based agents (MCTS, BoN, Beam).
+
+    These agents manage their own game state and require special handling.
+    """
+    print(f"\n{'='*60}")
+    print(f"  Benchmarking: {agent.name}")
+    print(f"  Scenario: {scenario}")
+    print(f"  Episodes: {episodes}")
+    if realtime:
+        print(f"  Pacing: REAL-TIME (frame_skip={frame_skip})")
+    else:
+        print(f"  Pacing: as-fast-as-possible")
+    print(f"{'='*60}")
+
+    # Setup game using the agent's preferred method
+    game = setup_game(scenario, match_visual=realtime, visible=True)
+    game.set_episode_timeout(400)
+    game.set_window_visible(False)  # Headless for benchmark
+
+    # Set game for the agent
+    agent.set_game(game)
+
+    results = []
+    frame_interval = frame_skip / 35.0
+
+    for ep in range(episodes):
+        game.new_episode()
+        agent.reset()
+
+        if armed:
+            arming_sequence(game)
+
+        step = 0
+        latencies = []
+        action_counts = Counter()
+        kills = 0
+        last_health = 100
+        last_armor = 0
+        damage_dealt = 0
+
+        while not game.is_episode_finished() and (max_steps is None or step < max_steps):
+            frame_start = time.perf_counter()
+
+            try:
+                last_health = game.get_game_variable(vizdoom.GameVariable.HEALTH)
+                last_armor = game.get_game_variable(vizdoom.GameVariable.ARMOR)
+                damage_dealt = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
+            except:
+                pass
+
+            # Get action from technique agent
+            t0 = time.perf_counter()
+            action_name, buttons, action_idx = agent.get_action(None, None)
+            latency = (time.perf_counter() - t0) * 1000
+            latencies.append(latency)
+            action_counts[action_name] += 1
+
+            # Execute action
+            reward = game.make_action(buttons, frame_skip)
+            if reward > 0:
+                kills += int(reward)
+            step += 1
+
+            # Advance the agent's tree
+            agent.advance_root(action_idx)
+
+            # Real-time pacing
+            if realtime:
+                elapsed = time.perf_counter() - frame_start
+                if elapsed < frame_interval:
+                    time.sleep(frame_interval - elapsed)
+
+        results.append({
+            'steps': step,
+            'kills': kills,
+            'health_remaining': max(0, last_health),
+            'armor_remaining': max(0, last_armor),
+            'damage_dealt': damage_dealt,
+            'latencies': latencies,
+            'action_counts': dict(action_counts),
+        })
+
+        if (ep + 1) % 5 == 0 or ep == 0:
+            print(f"  Episode {ep+1}: steps={step}, kills={kills}, HP={last_health:.0f}, Armor={last_armor:.0f}, Dmg={damage_dealt:.0f}")
+
+    game.close()
+    return results
+
+
+# ================================================================
+# Standard Benchmark Runner
 # ================================================================
 def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed=False, max_steps=None, visual=False):
     print(f"\n{'='*60}")
@@ -509,7 +883,8 @@ def print_comparison(all_results):
 def main():
     parser = argparse.ArgumentParser(description='Benchmark DOOM agents')
     parser.add_argument('--agent', default='all',
-                        choices=['multivec', 'gpt4mini', 'gpt5', 'random', 'openrouter', 'all'])
+                        choices=['multivec', 'mcts', 'mcts-dpo', 'bon', 'bon-dpo',
+                                 'beam', 'beam-dpo', 'gpt4mini', 'gpt5', 'random', 'openrouter', 'all'])
     parser.add_argument('--model', default='models/doom-multivec-trained')
     parser.add_argument('--scenario', default='deathmatch')
     parser.add_argument('--episodes', type=int, default=20)
@@ -525,6 +900,45 @@ def main():
     parser.add_argument('--output', default='benchmark_results.json')
     parser.add_argument('--actor-head',
                         help='Path to DPO-trained actor head (e.g., output/dpo-v1/final)')
+
+    # MCTS-specific arguments
+    parser.add_argument('--mcts-simulations', type=int, default=25,
+                        help='MCTS: Number of simulations per decision (default: 25)')
+    parser.add_argument('--mcts-depth', type=int, default=20,
+                        help='MCTS: Rollout depth in frames (default: 20)')
+    parser.add_argument('--mcts-exploration', type=float, default=1.414,
+                        help='MCTS: UCB1 exploration constant (default: sqrt(2))')
+    parser.add_argument('--mcts-batch-size', type=int, default=1,
+                        help='MCTS: Batch size for parallel simulations (default: 1)')
+
+    # BoN-specific arguments
+    parser.add_argument('--bon-rollouts', type=int, default=25,
+                        help='BoN: Number of rollouts per decision (default: 25)')
+    parser.add_argument('--bon-depth', type=int, default=20,
+                        help='BoN: Rollout depth in frames (default: 20)')
+    parser.add_argument('--bon-temperature', type=float, default=0.1,
+                        help='BoN: Policy sampling temperature (default: 0.1)')
+    parser.add_argument('--bon-llm-eval', action='store_true',
+                        help='BoN: Enable LLM-based evaluation')
+    parser.add_argument('--bon-llm-api-key', type=str, default=None,
+                        help='BoN: API key for LLM eval (defaults to TRITON_API_KEY env var)')
+    parser.add_argument('--bon-llm-sample-rate', type=float, default=0.05,
+                        help='BoN: Per-rollout probability of LLM call (default: 0.05)')
+    parser.add_argument('--bon-llm-blend', type=float, default=0.3,
+                        help='BoN: Weight of LLM value in score (default: 0.3)')
+    parser.add_argument('--bon-llm-cache-path', type=str, default=None,
+                        help='BoN: Path to load/save LLM cache')
+    parser.add_argument('--bon-llm-verbose', action='store_true',
+                        help='BoN: Print LLM responses')
+
+    # Beam-specific arguments
+    parser.add_argument('--beam-width', type=int, default=4,
+                        help='Beam: Number of sequences kept (default: 4)')
+    parser.add_argument('--beam-depth', type=int, default=8,
+                        help='Beam: Lookahead horizon in actions (default: 8)')
+    parser.add_argument('--beam-top-k', type=int, default=2,
+                        help='Beam: Children expanded per beam item (default: 2)')
+
     args = parser.parse_args()
 
     all_results = {}
@@ -533,8 +947,81 @@ def main():
     openrouter_url = 'https://openrouter.ai/api/v1'
 
     agents_to_run = []
+    technique_agents = []  # Agents that need run_benchmark_technique
+
     if args.agent in ('multivec', 'all'):
         agents_to_run.append(('MultiVec', MultiVecAgent(args.model, actor_head_path=args.actor_head)))
+    if args.agent in ('mcts', 'all'):
+        agent = MCTSAgentBenchmark(
+            args.model,
+            simulations=args.mcts_simulations,
+            depth=args.mcts_depth,
+            exploration=args.mcts_exploration,
+            batch_size=args.mcts_batch_size
+        )
+        technique_agents.append((agent.name, agent))
+    if args.agent in ('mcts-dpo', 'all'):
+        if not args.actor_head:
+            print("Warning: --mcts-dpo requires --actor-head. Using model path for DPO.")
+        agent = MCTSAgentBenchmark(
+            args.model,
+            actor_head_path=args.actor_head,
+            simulations=args.mcts_simulations,
+            depth=args.mcts_depth,
+            exploration=args.mcts_exploration,
+            batch_size=args.mcts_batch_size
+        )
+        technique_agents.append((agent.name, agent))
+    if args.agent in ('bon', 'all'):
+        agent = BoNAgentBenchmark(
+            args.model,
+            num_rollouts=args.bon_rollouts,
+            rollout_depth=args.bon_depth,
+            temperature=args.bon_temperature,
+            llm_eval=args.bon_llm_eval,
+            llm_api_key=args.bon_llm_api_key,
+            llm_sample_rate=args.bon_llm_sample_rate,
+            llm_blend=args.bon_llm_blend,
+            llm_cache_path=args.bon_llm_cache_path,
+            llm_verbose=args.bon_llm_verbose,
+        )
+        technique_agents.append((agent.name, agent))
+    if args.agent in ('bon-dpo', 'all'):
+        if not args.actor_head:
+            print("Warning: --bon-dpo requires --actor-head. Using model path for DPO.")
+        agent = BoNAgentBenchmark(
+            args.model,
+            actor_head_path=args.actor_head,
+            num_rollouts=args.bon_rollouts,
+            rollout_depth=args.bon_depth,
+            temperature=args.bon_temperature,
+            llm_eval=args.bon_llm_eval,
+            llm_api_key=args.bon_llm_api_key,
+            llm_sample_rate=args.bon_llm_sample_rate,
+            llm_blend=args.bon_llm_blend,
+            llm_cache_path=args.bon_llm_cache_path,
+            llm_verbose=args.bon_llm_verbose,
+        )
+        technique_agents.append((agent.name, agent))
+    if args.agent in ('beam', 'all'):
+        agent = BeamAgentBenchmark(
+            args.model,
+            beam_width=args.beam_width,
+            beam_depth=args.beam_depth,
+            top_k=args.beam_top_k
+        )
+        technique_agents.append((agent.name, agent))
+    if args.agent in ('beam-dpo', 'all'):
+        if not args.actor_head:
+            print("Warning: --beam-dpo requires --actor-head. Using model path for DPO.")
+        agent = BeamAgentBenchmark(
+            args.model,
+            actor_head_path=args.actor_head,
+            beam_width=args.beam_width,
+            beam_depth=args.beam_depth,
+            top_k=args.beam_top_k
+        )
+        technique_agents.append((agent.name, agent))
     if args.agent in ('random', 'all'):
         agents_to_run.append(('Random', RandomAgent()))
     if args.agent in ('gpt4mini', 'all'):
@@ -550,6 +1037,7 @@ def main():
         for m in or_models:
             agents_to_run.append((m.split('/')[-1], LLMAgent(m, base_url=openrouter_url, api_key=openrouter_key)))
 
+    # Run standard agents
     for name, agent in agents_to_run:
         try:
             results = run_benchmark(
@@ -565,6 +1053,41 @@ def main():
             metrics = compute_metrics(results)
             
             # Attach raw episode data so experiment_utils.py can log individual episodes
+            metrics['raw_episodes'] = [
+                {
+                    'steps': r['steps'],
+                    'kills': r['kills'],
+                    'health_remaining': r['health_remaining'],
+                    'armor_remaining': r['armor_remaining'],
+                    'damage_dealt': r['damage_dealt'],
+                    'avg_latency': float(np.mean(r['latencies'])) if r['latencies'] else 0.0
+                } for r in results
+            ]
+
+            all_results[agent.name] = metrics
+            print(f"\n  {agent.name}: avg_survival={metrics['avg_survival_steps']:.1f}, "
+                  f"avg_kills={metrics['avg_kills']:.1f}, "
+                  f"avg_armor={metrics['avg_armor_remaining']:.1f}, "
+                  f"avg_damage={metrics['avg_damage_dealt']:.1f}, "
+                  f"avg_latency={metrics['avg_latency_ms']:.1f}ms")
+        except Exception as e:
+            print(f"\n  {name} FAILED: {e}")
+
+    # Run technique agents (MCTS, BoN, Beam)
+    for name, agent in technique_agents:
+        try:
+            results = run_benchmark_technique(
+                agent,
+                args.scenario,
+                args.episodes,
+                args.frame_skip,
+                args.realtime,
+                args.armed,
+                args.steps,
+            )
+            metrics = compute_metrics(results)
+
+            # Attach raw episode data
             metrics['raw_episodes'] = [
                 {
                     'steps': r['steps'],

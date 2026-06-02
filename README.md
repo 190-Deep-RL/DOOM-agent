@@ -45,10 +45,10 @@ python scripts/benchmark.py --agent multivec --model models/doom-multivec-traine
 # Benchmark with DPO actor head
 python scripts/benchmark.py --agent multivec --model models/doom-multivec-5L --actor-head output/dpo-v1/final --episodes 10 --realtime --armed
 
-# Compare against LLM APIs (GPT-4o-mini, GPT-5, etc.)
-python scripts/benchmark.py --agent multivec --episodes 10 --realtime --armed
+python scripts/benchmark.py --agent mcts-dpo --model models/doom-multivec-5L --actor-head output/dpo-v1/final --episodes 10 --armed
+python scripts/benchmark.py --agent bon-dpo --model models/doom-multivec-5L --actor-head output/dpo-v1/final --episodes 10 --armed --bon-llm-eval
+python scripts/benchmark.py --agent beam-dpo --model models/doom-multivec-5L --actor-head output/dpo-v1/final --episodes 10 --armed
 ```
-
 
 
 ## TODO:

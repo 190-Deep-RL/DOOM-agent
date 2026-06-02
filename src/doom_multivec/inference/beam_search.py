@@ -258,7 +258,15 @@ class BeamSearchAgent:
             if self.prior_temperature != 1.0:
                 logits = logits / self.prior_temperature
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
-        return probs[:self.num_actions]
+        # Slice and renormalize to ensure probabilities sum to 1
+        probs = probs[:self.num_actions]
+        probs_sum = probs.sum()
+        if probs_sum > 0:
+            probs = probs / probs_sum
+        else:
+            # Fallback to uniform if something went wrong
+            probs = np.ones(self.num_actions) / self.num_actions
+        return probs
 
     # ---------- replay-based state restoration ----------
 
