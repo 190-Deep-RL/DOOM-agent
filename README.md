@@ -41,9 +41,14 @@ python scripts/play_doom_visual.py --model models/doom-multivec-5L --actor-head 
 
 # Run the benchmark
 python scripts/benchmark.py --agent multivec --model models/doom-multivec-trained --episodes 10 --realtime
+
+# Benchmark with DPO actor head
+python scripts/benchmark.py --agent multivec --model models/doom-multivec-5L --actor-head output/dpo-v1/final --episodes 10 --realtime --armed
+
+# Compare against LLM APIs (GPT-4o-mini, GPT-5, etc.)
+python scripts/benchmark.py --agent multivec --episodes 10 --realtime --armed
 ```
 
----
 
 
 ## TODO:

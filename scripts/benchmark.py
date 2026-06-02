@@ -18,6 +18,9 @@ Usage:
   # Benchmark GPT-5:
   python scripts/benchmark.py --agent gpt5 --episodes 10
 
+  # Benchmark with DPO actor head:
+  python scripts/benchmark.py --agent multivec --model models/doom-multivec-5L --actor-head output/dpo-v1/final --episodes 10
+
   # Compare all:
   python scripts/benchmark.py --agent all --episodes 10
 """
@@ -48,6 +51,8 @@ def compute_metrics(episodes):
     survival = [ep['steps'] for ep in episodes]
     kills = [ep['kills'] for ep in episodes]
     health = [ep['health_remaining'] for ep in episodes]
+    armor = [ep['armor_remaining'] for ep in episodes]
+    damage = [ep['damage_dealt'] for ep in episodes]
     latencies = []
     for ep in episodes:
         latencies.extend(ep['latencies'])
@@ -70,6 +75,9 @@ def compute_metrics(episodes):
         'avg_kills': np.mean(kills),
         'total_kills': sum(kills),
         'avg_health_remaining': np.mean(health),
+        'avg_armor_remaining': np.mean(armor),
+        'total_damage_dealt': sum(damage),
+        'avg_damage_dealt': np.mean(damage),
         'avg_latency_ms': np.mean(latencies) if latencies else 0,
         'p95_latency_ms': np.percentile(latencies, 95) if latencies else 0,
         'action_diversity_entropy': entropy,
@@ -87,6 +95,7 @@ def setup_game(scenario='defend_the_center', match_visual=False, visible=False):
         'defend_the_center': vizdoom.scenarios_path + '/defend_the_center.cfg',
         'deadly_corridor': vizdoom.scenarios_path + '/deadly_corridor.cfg',
         'my_way_home': vizdoom.scenarios_path + '/my_way_home.cfg',
+        'deathmatch': vizdoom.scenarios_path + '/deathmatch.cfg',
     }
     game.load_config(scenarios.get(scenario, scenario))
     game.set_screen_format(vizdoom.ScreenFormat.RGB24)
@@ -113,6 +122,8 @@ def setup_game(scenario='defend_the_center', match_visual=False, visible=False):
     game.add_available_game_variable(vizdoom.GameVariable.HEALTH)
     game.add_available_game_variable(vizdoom.GameVariable.AMMO2)
     game.add_available_game_variable(vizdoom.GameVariable.KILLCOUNT)
+    game.add_available_game_variable(vizdoom.GameVariable.ARMOR)
+    game.add_available_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
 
     game.init()
     game.set_seed(np.random.randint(0, 100000))
@@ -129,29 +140,47 @@ ACTION_BUTTONS = {
 
 
 # ================================================================
-# Agent: MultiVec Classifier
+# Agent: MultiVec Classifier (with optional DPO actor head)
 # ================================================================
 class MultiVecAgent:
-    def __init__(self, model_path):
+    def __init__(self, model_path, actor_head_path=None):
         import torch
-        from doom_multivec.model.classifier import DoomMultiVecClassifier
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        state = torch.load(os.path.join(model_path, 'model.pt'), map_location='cpu')
-        num_actions = 4
-        for key in state:
-            if 'classifier.weight' in key:
-                num_actions = state[key].shape[0]
-                break
-        self.model = DoomMultiVecClassifier(model_path, pool_mode='attention', num_actions=num_actions)
-        self.model.load_state_dict(state)
-        self.model.eval()
         self.converter = AsciiConverter(width=40, height=25)
-        self.name = f"MultiVec-{sum(p.numel() for p in self.model.parameters())/1e6:.1f}M"
+
+        # Check if loading DPO policy (actor head)
+        self.actor_head_path = actor_head_path
+        if actor_head_path or os.path.exists(os.path.join(model_path, 'actor_head.pt')):
+            # Load DPO policy
+            from doom_multivec.model.dpo_policy import DPODoomPolicy
+
+            dpo_path = actor_head_path if actor_head_path else model_path
+            self.model = DPODoomPolicy.from_pretrained(dpo_path, encoder_path=model_path)
+            self.model.eval()
+            self.name = f"MultiVec-DPO-{sum(p.numel() for p in self.model.parameters())/1e6:.1f}M"
+            self.is_dpo = True
+        else:
+            # Load standard classifier
+            from doom_multivec.model.classifier import DoomMultiVecClassifier
+
+            state = torch.load(os.path.join(model_path, 'model.pt'), map_location='cpu')
+            num_actions = 4
+            for key in state:
+                if 'classifier.weight' in key:
+                    num_actions = state[key].shape[0]
+                    break
+            self.model = DoomMultiVecClassifier(model_path, pool_mode='attention', num_actions=num_actions)
+            self.model.load_state_dict(state)
+            self.model.eval()
+            self.name = f"MultiVec-{sum(p.numel() for p in self.model.parameters())/1e6:.1f}M"
+            self.is_dpo = False
 
     def get_action(self, screen, depth):
         import torch
+        from doom_multivec.model.classifier import DoomMultiVecClassifier
+
         gray = np.mean(screen, axis=2).astype(np.uint8) if screen.ndim == 3 else screen
 
         if depth is not None:
@@ -178,10 +207,26 @@ class MultiVecAgent:
             result = self.model(encoded['input_ids'], encoded['attention_mask'], depth_ids=depth_ids)
             probs = torch.softmax(result['logits'], dim=-1)[0].numpy()
 
-        action_names = ACTION_NAMES[:len(probs)]
+        # Support both DoomMultiVecClassifier and DPODoomPolicy action names
+        num_actions = len(probs)
+        if hasattr(self.model, 'ACTION_NAMES'):
+            action_names = self.model.ACTION_NAMES[:num_actions]
+        else:
+            action_names = DoomMultiVecClassifier.ACTION_NAMES[:num_actions]
+
+        # Use appropriate button mapping based on number of actions
+        action_buttons = ACTION_BUTTONS if num_actions <= 4 else {
+            'shoot':        [1, 0, 0, 0, 0, 0],
+            'move_forward': [0, 1, 0, 0, 0, 0],
+            'turn_left':    [0, 0, 1, 0, 0, 0],
+            'turn_right':   [0, 0, 0, 1, 0, 0],
+            'strafe_left':  [0, 0, 0, 0, 1, 0],
+            'strafe_right': [0, 0, 0, 0, 0, 1],
+        }
+
         sorted_idx = np.argsort(probs)[::-1]
         top_action = action_names[sorted_idx[0]]
-        buttons = list(ACTION_BUTTONS[top_action])
+        buttons = list(action_buttons[top_action])
 
         # Shoot boost — exact same logic as play_doom_visual.py
         shoot_idx = action_names.index('shoot') if 'shoot' in action_names else -1
@@ -189,7 +234,7 @@ class MultiVecAgent:
             top_prob = probs[sorted_idx[0]]
             shoot_prob = probs[shoot_idx]
             if shoot_prob > top_prob * 0.75:
-                shoot_buttons = ACTION_BUTTONS['shoot']
+                shoot_buttons = action_buttons['shoot']
                 buttons = [max(a, b) for a, b in zip(buttons, shoot_buttons)]
                 top_action = f"{top_action}+shoot"
 
@@ -203,7 +248,7 @@ class MultiVecAgent:
                 top_cat = 'move' if top_base in movement else 'rot'
                 sec_cat = 'move' if second_action in movement else 'rot'
                 if top_cat != sec_cat:
-                    sec_buttons = ACTION_BUTTONS[second_action]
+                    sec_buttons = action_buttons[second_action]
                     buttons = [max(a, b) for a, b in zip(buttons, sec_buttons)]
                     top_action = f"{top_action}+{second_action}"
 
@@ -388,6 +433,8 @@ def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed
         action_counts = Counter()
         kills = 0
         last_health = 100
+        last_armor = 0
+        damage_dealt = 0
 
         while not game.is_episode_finished() and (max_steps is None or step < max_steps):
             frame_start = time.perf_counter()
@@ -401,6 +448,8 @@ def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed
 
             try:
                 last_health = game.get_game_variable(vizdoom.GameVariable.HEALTH)
+                last_armor = game.get_game_variable(vizdoom.GameVariable.ARMOR)
+                damage_dealt = game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT)
             except:
                 pass
 
@@ -426,12 +475,14 @@ def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed
             'steps': step,
             'kills': kills,
             'health_remaining': max(0, last_health),
+            'armor_remaining': max(0, last_armor),
+            'damage_dealt': damage_dealt,
             'latencies': latencies,
             'action_counts': dict(action_counts),
         })
 
         if (ep + 1) % 5 == 0 or ep == 0:
-            print(f"  Episode {ep+1}: steps={step}, kills={kills}, HP={last_health:.0f}")
+            print(f"  Episode {ep+1}: steps={step}, kills={kills}, HP={last_health:.0f}, Armor={last_armor:.0f}, Dmg={damage_dealt:.0f}")
 
     game.close()
     return results
@@ -439,19 +490,20 @@ def run_benchmark(agent, scenario, episodes, frame_skip=4, realtime=False, armed
 
 def print_comparison(all_results):
     """Print comparison table."""
-    print(f"\n{'='*80}")
+    print(f"\n{'='*102}")
     print(f"  BENCHMARK RESULTS")
-    print(f"{'='*80}")
-    print(f"{'Agent':>25s} | {'Avg Surv':>8s} | {'Max Surv':>8s} | {'Avg Kill':>8s} | {'Tot Kill':>8s} | {'Avg HP':>6s} | {'Lat ms':>7s} | {'Entropy':>7s}")
-    print(f"{'-'*25}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*6}-+-{'-'*7}-+-{'-'*7}")
+    print(f"{'='*102}")
+    print(f"{'Agent':>25s} | {'Avg Surv':>8s} | {'Max Surv':>8s} | {'Avg Kill':>8s} | {'Tot Kill':>8s} | {'Avg HP':>6s} | {'Avg Armor':>9s} | {'Avg Dmg':>8s} | {'Lat ms':>7s} | {'Entropy':>7s}")
+    print(f"{'-'*25}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*6}-+-{'-'*9}-+-{'-'*8}-+-{'-'*7}-+-{'-'*7}")
 
     for agent_name, metrics in all_results.items():
         print(f"{agent_name:>25s} | {metrics['avg_survival_steps']:>8.1f} | {metrics['max_survival_steps']:>8.0f} | "
               f"{metrics['avg_kills']:>8.1f} | {metrics['total_kills']:>8.0f} | "
-              f"{metrics['avg_health_remaining']:>6.1f} | {metrics['avg_latency_ms']:>7.1f} | "
+              f"{metrics['avg_health_remaining']:>6.1f} | {metrics['avg_armor_remaining']:>9.1f} | "
+              f"{metrics['avg_damage_dealt']:>8.1f} | {metrics['avg_latency_ms']:>7.1f} | "
               f"{metrics['action_diversity_entropy']:>7.2f}")
 
-    print(f"{'='*80}\n")
+    print(f"{'='*102}\n")
 
 
 def main():
@@ -459,7 +511,7 @@ def main():
     parser.add_argument('--agent', default='all',
                         choices=['multivec', 'gpt4mini', 'gpt5', 'random', 'openrouter', 'all'])
     parser.add_argument('--model', default='models/doom-multivec-trained')
-    parser.add_argument('--scenario', default='defend_the_center')
+    parser.add_argument('--scenario', default='deathmatch')
     parser.add_argument('--episodes', type=int, default=20)
     parser.add_argument('--frame-skip', type=int, default=4)
     parser.add_argument('--steps', type=int, default=None,
@@ -471,6 +523,8 @@ def main():
     parser.add_argument('--visual', action='store_true',
                         help='Show the VizDoom game window during benchmarking')
     parser.add_argument('--output', default='benchmark_results.json')
+    parser.add_argument('--actor-head',
+                        help='Path to DPO-trained actor head (e.g., output/dpo-v1/final)')
     args = parser.parse_args()
 
     all_results = {}
@@ -480,7 +534,7 @@ def main():
 
     agents_to_run = []
     if args.agent in ('multivec', 'all'):
-        agents_to_run.append(('MultiVec', MultiVecAgent(args.model)))
+        agents_to_run.append(('MultiVec', MultiVecAgent(args.model, actor_head_path=args.actor_head)))
     if args.agent in ('random', 'all'):
         agents_to_run.append(('Random', RandomAgent()))
     if args.agent in ('gpt4mini', 'all'):
@@ -516,13 +570,17 @@ def main():
                     'steps': r['steps'],
                     'kills': r['kills'],
                     'health_remaining': r['health_remaining'],
+                    'armor_remaining': r['armor_remaining'],
+                    'damage_dealt': r['damage_dealt'],
                     'avg_latency': float(np.mean(r['latencies'])) if r['latencies'] else 0.0
                 } for r in results
             ]
-            
+
             all_results[agent.name] = metrics
             print(f"\n  {agent.name}: avg_survival={metrics['avg_survival_steps']:.1f}, "
                   f"avg_kills={metrics['avg_kills']:.1f}, "
+                  f"avg_armor={metrics['avg_armor_remaining']:.1f}, "
+                  f"avg_damage={metrics['avg_damage_dealt']:.1f}, "
                   f"avg_latency={metrics['avg_latency_ms']:.1f}ms")
         except Exception as e:
             print(f"\n  {name} FAILED: {e}")
