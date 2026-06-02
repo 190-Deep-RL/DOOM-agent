@@ -33,6 +33,8 @@ class RolloutResult:
     score: float
     rule_score: float = 0.0
     llm_score: Optional[float] = None  # mean cached value over trajectory, if any
+    rollout_kills: int = 0
+    rollout_damage: float = 0.0
 
 
 class BestOfNAgent:
@@ -47,8 +49,6 @@ class BestOfNAgent:
         retention_count: Number of leading actions from the best rollout to
             keep and replay before planning again (default: 1).
         temperature: Softmax temperature for policy sampling (default: 0.7).
-        prior_temperature: Sharpening applied to the base 4-way model logits
-            before composite expansion (default: 1.0).
         use_composite_moves: Expand action space to include 7 composite
             two-button moves (default: True).
         composite_logit_weights: Per-component weight when summing into a
@@ -84,8 +84,7 @@ class BestOfNAgent:
         num_rollouts: int = 25,
         rollout_depth: int = 20,
         retention_count: int = 10,
-        temperature: float = 0.2,
-        prior_temperature: float = 1.0,
+        temperature: float = 0.1,
         use_composite_moves: bool = True,
         composite_logit_weights: Optional[List[float]] = None,
         device: str = 'cpu',
@@ -102,7 +101,6 @@ class BestOfNAgent:
         self.rollout_depth = rollout_depth
         self.retention_count = max(1, int(retention_count))
         self.temperature = temperature
-        self.prior_temperature = prior_temperature
         self.use_composite_moves = use_composite_moves
         self.composite_logit_weights = composite_logit_weights or [50.0, 0.7, 4.0, 4.0]
         self.device = device
@@ -235,8 +233,6 @@ class BestOfNAgent:
             result = self.model(input_ids, attention_mask, depth_ids=depth_ids)
             logits = result['logits'][0]
             logits = self._expand_composite_logits(logits)
-            if self.prior_temperature != 1.0:
-                logits = logits / self.prior_temperature
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs[:self.num_actions]
 
@@ -251,16 +247,14 @@ class BestOfNAgent:
 
     # ---------- rollout machinery ----------
 
-    def _read_metrics(self) -> Tuple[float, float, float]:
+    def _read_metrics(self) -> Tuple[float, float, float, float]:
         import vizdoom
         return (
             self.current_game.get_game_variable(vizdoom.GameVariable.HEALTH),
             self.current_game.get_game_variable(vizdoom.GameVariable.ARMOR),
             self.current_game.get_game_variable(vizdoom.GameVariable.KILLCOUNT),
+            self.current_game.get_game_variable(vizdoom.GameVariable.DAMAGECOUNT),
         )
-
-    def _score(self, start, end) -> float:
-        return self.current_game.get_total_reward()
 
     def _restore_to_root(self) -> None:
         """Load the root snapshot and reset held buttons.
@@ -288,6 +282,7 @@ class BestOfNAgent:
             step = max(1, self.rollout_depth // self.llm_frames_per_rating)
             capture_indices = set(range(0, self.rollout_depth, step))
 
+        start_value = self.current_game.get_total_reward()
         for i in range(self.rollout_depth):
             if self.current_game.is_episode_finished():
                 break
@@ -310,11 +305,17 @@ class BestOfNAgent:
                 self.frame_skip,
             )
 
-        if self.current_game.is_episode_finished():
-            rule_score = 0.0
-        else:
-            end = self._read_metrics()
-            rule_score = self._score(start, end)
+        # Read end metrics regardless of whether the episode finished so
+        # we can compute precise deltas (kills/damage) for this rollout.
+        end = self._read_metrics()
+        start_health, start_armor, start_kills, start_damage = start
+        end_health, end_armor, end_kills, end_damage = end
+        rollout_kills = int(max(0, end_kills - start_kills))
+        rollout_damage = float(max(0.0, end_damage - start_damage))
+
+        end_value = self.current_game.get_total_reward()
+        rule_score = float(end_value - start_value)
+        print(f"Rollout result: {rule_score:.2f}")
 
         # Cache: query existing entries for a value blend (always free).
         llm_value = None
@@ -337,6 +338,8 @@ class BestOfNAgent:
             score=score,
             rule_score=rule_score,
             llm_score=llm_value,
+            rollout_kills=rollout_kills,
+            rollout_damage=rollout_damage,
         )
 
     def _probs_from_ascii(self, ascii_frame: str, depth_bins) -> np.ndarray:
@@ -346,14 +349,12 @@ class BestOfNAgent:
             result = self.model(input_ids, attention_mask, depth_ids=depth_ids)
             logits = result['logits'][0]
             logits = self._expand_composite_logits(logits)
-            if self.prior_temperature != 1.0:
-                logits = logits / self.prior_temperature
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs[:self.num_actions]
 
     # ---------- public ----------
 
-    def get_action(self) -> Tuple[str, List[int], int, Dict[str, Dict[str, float]]]:
+    def get_action(self) -> Tuple[str, List[int], int, Dict[str, Dict[str, float]], int, float]:
         if self.current_game is None:
             raise RuntimeError("Game not set. Call set_game() first.")
 
@@ -361,7 +362,8 @@ class BestOfNAgent:
             action_idx = int(self._retained_actions.popleft())
             action_name = self.action_names[action_idx]
             buttons = self.action_to_buttons[action_name]
-            return action_name, buttons, action_idx, dict(self._benchmark_sink)
+            # No rollout stats available for retained actions; return zeros.
+            return action_name, buttons, action_idx, dict(self._benchmark_sink), 0, 0.0
 
         t0 = time.perf_counter()
         # Root snapshot taken once per decision while game is live.
@@ -371,6 +373,8 @@ class BestOfNAgent:
 
         scores_by_action: Dict[int, list] = defaultdict(list)
         best_result: Optional[RolloutResult] = None
+        last_simulation_kills = 0
+        last_simulation_damage = 0.0
         try:
             for i in range(self.num_rollouts):
                 result = self._rollout_once()
@@ -384,6 +388,9 @@ class BestOfNAgent:
                     scores_by_action[result.action_sequence[0]].append(result.score)
                 if best_result is None or result.score > best_result.score:
                     best_result = result
+                # Track last rollout's kills/damage for fallback when rollouts fail
+                last_simulation_kills = int(result.rollout_kills)
+                last_simulation_damage = float(result.rollout_damage)
         finally:
             # Always restore the live game to the real root, regardless of
             # whether any rollout finished the episode.
@@ -415,4 +422,4 @@ class BestOfNAgent:
         buttons = self.action_to_buttons[action_name]
 
         self._record_benchmark('get_action', time.perf_counter() - t0)
-        return action_name, buttons, best_action, dict(self._benchmark_sink)
+        return action_name, buttons, best_action, dict(self._benchmark_sink), last_simulation_kills, last_simulation_damage
