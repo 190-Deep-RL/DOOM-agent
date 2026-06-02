@@ -104,7 +104,7 @@ class BestOfNAgent:
         self.temperature = temperature
         self.prior_temperature = prior_temperature
         self.use_composite_moves = use_composite_moves
-        self.composite_logit_weights = composite_logit_weights or [50.0, 0.7, 4.0, 4.0]
+        self.composite_logit_weights = composite_logit_weights or [50.0, 0.7, 5.0, 5.0]
         self.device = device
         self.frame_skip = frame_skip
         self.temp_dir = temp_dir or tempfile.gettempdir()
